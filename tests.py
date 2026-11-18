@@ -287,7 +287,7 @@ class ServerTests(unittest.TestCase):
 
     def test_tools_registered(self):
         names = {t.name for t in asyncio.run(server.server.list_tools())}
-        self.assertEqual(names, {'observe', 'locate', 'next_step', 'act', 'focus_window'})
+        self.assertEqual(names, {'observe', 'locate', 'next_step', 'act', 'focus_window', 'list_windows'})
 
 
 import agent_tools
@@ -299,6 +299,46 @@ def el(i, role, name, x, y):
 
 
 class PerceptionTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows window inventory')
+    def test_inventory_keeps_distinct_ids_and_marks_foreground_and_native_state(self):
+        user32 = mock.Mock()
+
+        def process(hwnd, pid):
+            if hwnd == 40:
+                return 0
+            pid._obj.value = hwnd + 500
+            return 1
+
+        user32.GetWindowThreadProcessId.side_effect = process
+        user32.IsWindowVisible.side_effect = lambda hwnd: hwnd != 50
+        user32.IsIconic.side_effect = lambda hwnd: hwnd == 20
+        user32.IsWindowEnabled.side_effect = lambda hwnd: hwnd == 30
+        titles = [(10, 'Own console'), (20, 'Document'), (30, '\u202eDocument'),
+                  (40, 'Closed'), (50, 'Hidden'), (60, '\u202e')]
+        with mock.patch.object(perception, '_user32', return_value=user32), \
+                mock.patch.object(perception, 'list_windows', return_value=titles), \
+                mock.patch.object(perception, '_own_console', return_value=10), \
+                mock.patch.object(perception, 'foreground_hwnd', return_value=30):
+            result = perception.window_inventory()
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['untrusted_text'])
+        self.assertEqual(result['identity_scope'], 'current_windows_desktop')
+        self.assertEqual(result['foreground_hwnd'], 30)
+        self.assertEqual(result['windows'], [
+            {'hwnd': 30, 'process_id': 530, 'title': 'Document',
+             'foreground': True, 'minimized': False, 'enabled': True},
+            {'hwnd': 20, 'process_id': 520, 'title': 'Document',
+             'foreground': False, 'minimized': True, 'enabled': False},
+        ])
+
+    def test_inventory_reports_unsupported_platform_without_windows_access(self):
+        with mock.patch.object(perception.sys, 'platform', 'linux'), \
+                mock.patch.object(perception, '_user32') as user32:
+            result = perception.window_inventory()
+        self.assertEqual(result['status'], 'unsupported_platform')
+        self.assertEqual(result['windows'], [])
+        user32.assert_not_called()
+
     def test_dedupe_link_button_pair(self):
         raw = [perception.Element('', 'link', 'Songs', 186, 413, 0, 400, 300, 426),
                perception.Element('', 'button', 'Songs', 186, 413, 0, 400, 300, 426),

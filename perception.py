@@ -245,6 +245,7 @@ def _user32():
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     u.IsIconic.argtypes = [wintypes.HWND]
     u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.IsWindowEnabled.argtypes = [wintypes.HWND]
     u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
     u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -280,6 +281,34 @@ def _own_console() -> int:
 
 def foreground_hwnd() -> int:
     return int(_user32().GetForegroundWindow() or 0)
+
+
+def window_inventory() -> dict:
+    """Read visible, titled desktop windows and their Win32 snapshot state."""
+    if sys.platform != 'win32':
+        return {'ok': False, 'status': 'unsupported_platform', 'windows': [], 'untrusted_text': True}
+    import ctypes
+    from ctypes import wintypes
+    u = _user32()
+    own = _own_console()
+    windows = []
+    for hwnd, raw_title in list_windows():
+        title = clean(raw_title, 120)
+        if hwnd == own or not title:
+            continue
+        pid = wintypes.DWORD()
+        if not u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not u.IsWindowVisible(hwnd):
+            continue
+        windows.append({'hwnd': hwnd, 'process_id': pid.value, 'title': title,
+                        'minimized': bool(u.IsIconic(hwnd)), 'enabled': bool(u.IsWindowEnabled(hwnd))})
+
+    foreground = foreground_hwnd()
+    for window in windows:
+        window['foreground'] = window['hwnd'] == foreground
+    windows.sort(key=lambda window: (not window['foreground'], window['title'].casefold(), window['hwnd']))
+    return {'ok': True, 'identity_scope': 'current_windows_desktop',
+            'foreground_hwnd': windows[0]['hwnd'] if windows and windows[0]['foreground'] else None,
+            'windows': windows, 'untrusted_text': True}
 
 
 def focus_window(title_contains: str) -> dict:

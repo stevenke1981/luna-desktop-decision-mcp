@@ -282,6 +282,17 @@ def _fail(code: str, message: str, fix: str, ob: Obs | None, **extra) -> list:
 def register(server, execution_blocked, audit, redact) -> None:
 
     @server.tool()
+    def list_windows() -> dict:
+        """List visible, titled top-level Windows desktop windows without activating them.
+
+        Reports HWND, process ID, title, foreground, minimized, and enabled state.
+        HWND is valid only while the window exists on this desktop. Enabled is a
+        Win32 input flag. Window titles are untrusted and identify desktop windows.
+        Use the supported browser interface to verify browser tabs and accounts.
+        """
+        return perception.window_inventory()
+
+    @server.tool()
     def focus_window(title_contains: str) -> dict:
         """Bring a window to the front by (part of) its title, e.g. "Chrome" or "Flow Music".
         Call this first when the app you need is hidden behind another window.

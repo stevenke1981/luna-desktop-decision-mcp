@@ -10,10 +10,11 @@ Decisions 只回傳型別化答案（choice／predicate／score），不會回�
 3. 看不到元素時改用**格線**：Luna 選欄、選列 → 放大再選 → 換算成座標。
 4. 回應給 agent 的是**可直接呼叫的參數**（`next`）與**狀態碼**，能力較弱的 agent 照著做就行。
 
-## 工具（預設 5 個）
+## 工具（預設 6 個）
 
 | 工具 | 用途 | Luna 呼叫 |
 |---|---|---|
+| `list_windows()` | 唯讀列出 Windows 桌面的可見視窗、前景與最小化狀態 | 0 |
 | `focus_window(title_contains)` | 把指定視窗帶到最前面 | 0 |
 | `observe()` | 列出前景視窗元素：`e12 button "Songs" (186,413)`；`include_image=true` 附標號截圖 | 0 |
 | `locate(target)` | 用描述找元素（名稱比對 → Luna 選元素 → 格線） | 0–3 |
@@ -21,6 +22,8 @@ Decisions 只回傳型別化答案（choice／predicate／score），不會回�
 | `act(goal, action, element_id/obs 或 target 或 x/y, …)` | 一次完成：定位 → 安全判斷 → 執行 → 驗證 `expect` → 回傳新畫面元素；`plan_next=true` 同時給下一步 | 0–1（+定位） |
 
 舊的低階工具（`judge_desktop_action`、`perform_desktop_action`、`check_screen`、`choose_desktop_action`、`capture_screen`）需設 `LUNA_LEGACY_TOOLS=1` 才會出現。
+
+`list_windows()` 回傳有標題的可見頂層視窗，略過伺服器自己的主控台。`hwnd` 和 `process_id` 可在目前 Windows 桌面的視窗存續期間用於辨識，重新開啟視窗後請重新列舉。`enabled` 是 Win32 的輸入狀態，實際操作仍須通過工具原有的安全檢查。標題屬於不可信資料，僅供辨識視窗。
 
 ### `act` 的狀態碼
 
@@ -47,7 +50,7 @@ Decisions 只回傳型別化答案（choice／predicate／score），不會回�
 
 | 操作 | 本 MCP |
 |---|---|
-| 視窗與觀察 | `focus_window` 依標題啟用，`observe` 讀取前景 UIA 與選用截圖。視窗列舉、應用程式列舉與啟動未提供獨立工具。 |
+| 視窗與觀察 | `list_windows` 提供唯讀視窗列舉，`focus_window` 依標題啟用，`observe` 讀取前景 UIA 與選用截圖。應用程式列舉與啟動未提供獨立工具。 |
 | 語意定位 | `locate` 依 UIA 名稱、Luna 元素候選或畫面格線定位。 |
 | 文字與值 | `act(action="type")` 在插入點輸入或取代選取文字，支援文字傳遞收據。任意控制項的 `set_value` 未提供。 |
 | 點擊、鍵盤與捲動 | `act` 提供點擊、雙擊、右鍵、按鍵與捲動。拖曳由啟用後的舊版 `perform_desktop_action` 提供。 |
