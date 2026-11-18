@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -292,6 +293,33 @@ class AgentToolTests(unittest.TestCase):
                                action='type', element_id='e1', text='hi', submit=True)
         j.assert_called_once()                      # submit makes it risky
         self.assertEqual([c.args[0]['type'] for c in ex.call_args_list], ['click', 'type', 'keypress'])
+
+    def test_preapproval_skips_confirm_but_not_deny(self):
+        send = el(1, 'button', 'Send message', 300, 200)
+        win = perception.Window('Google Flow Music - Google Chrome', 77, 0, 0, 1920, 1080)
+        with mock.patch.dict(os.environ, {'LUNA_PREAPPROVE': 'flow music:send message'}):
+            ob = make_obs(send, window=win)
+            k = {'by': 'element_id'}
+            self.assertTrue(agent_tools.preapproval(ob, send, 'click', k))
+            self.assertIsNone(agent_tools.preapproval(ob, send, 'click', {'by': 'grid'}))
+            self.assertIsNone(agent_tools.preapproval(ob, send, 'double_click', k))
+            other = el(2, 'button', 'Send message to everyone', 1, 1)
+            self.assertIsNone(agent_tools.preapproval(ob, other, 'click', k))
+            gmail = make_obs(send, window=perception.Window('Gmail', 77, 0, 0, 9, 9))
+            self.assertIsNone(agent_tools.preapproval(gmail, send, 'click', k))
+            with mock.patch.object(agent_tools, '_STARTED', time.time() - 3600):
+                self.assertIsNone(agent_tools.preapproval(ob, send, 'click', k))
+
+    def test_preapproved_click_executes_and_deny_still_blocks(self):
+        with mock.patch.dict(os.environ, {'LUNA_PREAPPROVE': 'App:Send'}):
+            res, ex, _ = self._act([el(1, 'button', 'Send', 300, 200)], judge='confirm',
+                                   element_id='e1')
+            ex.assert_called_once()
+            self.assertIn('pre-approved', res['judge']['reasons'][-1])
+            res, ex, _ = self._act([el(1, 'button', 'Send', 300, 200)], judge='deny',
+                                   element_id='e1')
+            ex.assert_not_called()
+            self.assertEqual(res['error']['code'], 'DENIED')
 
     def test_confirm_then_approval_id(self):
         gen = el(1, 'button', 'Generate', 300, 200)
