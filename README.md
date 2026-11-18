@@ -30,6 +30,7 @@ Decisions 只回傳型別化答案（choice／predicate／score），不會回�
 
 - **低風險步驟不判斷**（捲動、Esc/Tab/方向鍵、點一般連結／分頁／欄位、輸入不送出）→ 0 次 Luna。
 - **高風險一律判斷**：名稱含 send/submit/delete/pay/buy/generate/install/送出/刪除/付款/購買/產生/安裝…、密碼欄、Enter 或送出、終端機視窗、網址列、格線或座標定位的未知目標。`LUNA_JUDGE=always` 可改成每步都判斷。
+- **事先同意**（`LUNA_PREAPPROVE`）：你已經交代過的送出鍵（例如「做一首歌」時的 Send message）不必每次再核准。只適用於「點擊」有名稱的 UIA 元素，按鈕名稱需完全相符、視窗標題需包含指定文字，格線或座標定位不算；Luna 仍會判斷，`deny` 照樣擋下。設定放在伺服器環境變數，agent 無法自己授權。
 - 判斷用的動作描述由**伺服器依 UIA 名稱產生**，不採用 agent 的文字，避免換句話說繞過；被 `deny` 的動作在畫面未變前會直接拒絕。
 - 執行前檢查前景視窗與滑鼠下的元素（UIA hit-test），被遮住或失焦就回 `occluded`／`focus_lost`，不會點錯視窗。
 - 送給 Luna 的截圖只裁切目標視窗（不含 agent 自己的終端機），並以 JPEG 傳送。
@@ -57,6 +58,8 @@ python -m venv .venv
 | `LUNA_JUDGE` | `risky` | `always` = 每步都判斷 |
 | `LUNA_CONFIRM_POLICY` | `approve` | 舊工具用；`never` = `confirm` 一律不執行 |
 | `LUNA_LEGACY_TOOLS` | 未設 | `1` = 也提供舊的低階工具 |
+| `LUNA_PREAPPROVE` | 未設 | 你事先同意的操作，略過 `needs_approval`。格式 `視窗標題片段:按鈕完整名稱`，多筆用 `;` 分隔，例如 `Flow Music:Send message` |
+| `LUNA_PREAPPROVE_MINUTES` | `30` | 事先同意在伺服器啟動後多久失效；`0` = 不失效 |
 | `LUNA_LOCATE_MIN_CONFIDENCE` / `LUNA_LOCATE_MIN_MARGIN` | `0.6` / `0.25` | Luna 選元素時的最低機率與領先差距，不足則回 `ambiguous` |
 | `LUNA_MCP_TOKEN` | — | HTTP 模式必填，≥ 24 字元隨機字串 |
 | `LUNA_SCREENSHOT_MAX_WIDTH` | `1600` | 截圖縮放寬度 |

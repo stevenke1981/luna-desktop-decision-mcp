@@ -31,6 +31,29 @@ LOCATE_MARGIN = float(os.environ.get('LUNA_LOCATE_MIN_MARGIN', '0.25'))
 JUDGE_MODE = os.environ.get('LUNA_JUDGE', 'risky')          # risky | always
 GRID1, GRID2 = (16, 9), (8, 6)
 APPROVAL_TTL = 120
+_STARTED = time.time()
+
+
+def preapproval(ob: 'Obs', el, action: str, where: dict) -> str | None:
+    """User-set standing approvals: LUNA_PREAPPROVE="Flow Music:Send message;Gmail:Send".
+    Each entry is <text in the window title>:<exact element name>. They only cover clicks
+    on a named UI Automation element (never grid or raw coordinates), expire
+    LUNA_PREAPPROVE_MINUTES (default 30) after the server starts, and never override a
+    deny. Agents cannot set them: they live in the server's environment."""
+    raw = os.environ.get('LUNA_PREAPPROVE', '').strip()
+    minutes = float(os.environ.get('LUNA_PREAPPROVE_MINUTES', '30'))
+    if not raw or el is None or action != 'click' or not ob.window or not el.name:
+        return None
+    if where.get('by') not in ('element_id', 'name_match', 'luna_element'):
+        return None
+    if minutes > 0 and time.time() - _STARTED > minutes * 60:
+        return None
+    title, name = ob.window.title.casefold(), el.name.strip().casefold()
+    for entry in raw.split(';'):
+        win, sep, button = entry.rpartition(':')
+        if sep and win.strip() and win.strip().casefold() in title                 and button.strip().casefold() == name:
+            return entry.strip()
+    return None
 
 RISKY_WORDS = re.compile(
     r'send|submit|delete|remove|pay|buy|purchase|order|checkout|generate|create|publish|post|'
@@ -495,6 +518,11 @@ def register(server, execution_blocked, audit, redact) -> None:
             return _fail('DENIED', 'Luna judged this action unsafe or wrong for the goal: '
                          + '; '.join(reasons),
                          'Do not retry or reword it. Call next_step or ask the user.', ob)
+        if verdict == 'confirm' and not approved:
+            rule = preapproval(ob, el, action, where)
+            if rule:
+                approved = True
+                reasons = reasons + [f'pre-approved by the user (LUNA_PREAPPROVE "{rule}")']
         if verdict == 'confirm' and not approved:
             aid = 'ap_' + secrets.token_hex(3)
             S['approvals'][aid] = {'key': key, 'exp': time.time() + APPROVAL_TTL,

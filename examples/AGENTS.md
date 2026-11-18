@@ -17,7 +17,8 @@ Paste this into `AGENTS.md` (Codex), a project instruction (ChatGPT), `CLAUDE.md
      at `state` and `elements` and decide again.
    - `needs_approval`: stop and ask the user. Explain `error.message`. Only if
      they agree, repeat the exact same call with `approval_id`. Never reword the
-     request to get a different answer.
+     request to get a different answer. (Steps the user pre-approved in the server's
+     `LUNA_PREAPPROVE` setting run without this; you cannot add pre-approvals.)
    - `denied`: do not retry or reword. Try a different approach or ask the user.
    - `ambiguous`: pick one of the `candidates` by `element_id`.
    - `stale`, `not_found`: pick from the fresh `elements`, scroll, or close popups.
