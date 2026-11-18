@@ -1,5 +1,6 @@
 """Offline tests: no network, no real mouse/keyboard. Run: python tests.py"""
 import asyncio
+import json
 import os
 import unittest
 from unittest import mock
@@ -108,9 +109,17 @@ class DesktopTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 desktop.validate(bad, self.shot)
 
-    def test_annotate_marks_target(self):
+    def test_annotate_ring_leaves_target_visible(self):
         img = desktop.annotate(self.shot, {'type': 'click', 'x': 960, 'y': 540})
-        self.assertEqual(img.getpixel((400, 225)), (255, 0, 0))
+        self.assertEqual(img.getpixel((400, 225)), (0, 0, 0))          # centre untouched
+        ring = [img.getpixel((400 + dx, 225)) for dx in range(-40, 41)]
+        self.assertIn((255, 0, 0), ring)
+
+    def test_crop_keeps_screen_mapping(self):
+        sub = self.shot.crop(480, 270, 1440, 810)       # screen rect -> image (200,112)..(600,337)
+        self.assertEqual(sub.image.size, (400, 225))
+        self.assertEqual(sub.to_screen(0, 0), (480, 269))
+        self.assertEqual(sub.to_screen(200, 112.5), (960, 539))
 
     def test_key_map(self):
         self.assertEqual([desktop.map_key(k) for k in ['CTRL', 'ArrowLeft', 'a']],
@@ -136,7 +145,7 @@ class ServerTests(unittest.TestCase):
                 mock.patch.object(desktop, 'capture', return_value=shot), \
                 mock.patch.object(decisions, 'judge', return_value=j), \
                 mock.patch.object(desktop, 'execute') as ex, \
-                mock.patch.object(server.time, 'sleep'):
+                mock.patch.object(desktop, 'wait_stable'):
             server.perform_desktop_action('g', CLICK)
             ex.assert_not_called()
             server.perform_desktop_action('g', CLICK, user_approved=True)
@@ -162,8 +171,248 @@ class ServerTests(unittest.TestCase):
 
     def test_tools_registered(self):
         names = {t.name for t in asyncio.run(server.server.list_tools())}
-        self.assertEqual(names, {'capture_screen', 'judge_desktop_action', 'choose_desktop_action',
-                                 'check_screen', 'perform_desktop_action'})
+        self.assertEqual(names, {'observe', 'locate', 'next_step', 'act', 'focus_window'})
+
+
+import agent_tools
+import perception
+
+
+def el(i, role, name, x, y):
+    return perception.Element(f'e{i}', role, name, x, y, x - 10, y - 5, x + 10, y + 5)
+
+
+class PerceptionTests(unittest.TestCase):
+    def test_dedupe_link_button_pair(self):
+        raw = [perception.Element('', 'link', 'Songs', 186, 413, 0, 400, 300, 426),
+               perception.Element('', 'button', 'Songs', 186, 413, 0, 400, 300, 426),
+               perception.Element('', 'textbox', '', 600, 413, 500, 400, 700, 426),
+               perception.Element('', 'button', 'Search', 600, 413, 500, 400, 700, 426),
+               perception.Element('', 'button', 'Close', 900, 20, 890, 10, 910, 30)]
+        out = perception.dedupe(raw)
+        self.assertEqual([(e.id, e.role, e.name) for e in out],
+                         [('e1', 'button', 'Close'), ('e2', 'button', 'Songs'),
+                          ('e3', 'textbox', 'Search')])
+
+    def test_clean_strips_controls(self):
+        self.assertEqual(perception.clean('ok\u202e\x07 now' + 'x' * 100)[:8], 'ok   now')
+        self.assertEqual(len(perception.clean('x' * 100)), 60)
+
+    def test_grid_cells(self):
+        labels = perception.grid_labels(16, 9)
+        self.assertEqual((len(labels), labels[0], labels[-1]), (144, 'A1', 'P9'))
+        self.assertEqual(perception.cell_box(1, 2, 16, 9, 1600, 900), (100, 200, 200, 300))
+
+    def test_marks_tag_outside_box(self):
+        shot = desktop.Shot(Image.new('RGB', (800, 450)), 2.0, 1600, 900)
+        img = perception.draw_marks(shot, [el(1, 'button', 'OK', 400, 400)])
+        self.assertEqual(img.getpixel((195, 196)), (255, 0, 140))       # box edge
+        self.assertEqual(img.getpixel((197, 190)), (255, 0, 140))       # tag above the box
+
+
+WIN = perception.Window('App', 77, 0, 0, 1920, 1080)
+
+
+def make_obs(*elements, window=WIN):
+    shot = desktop.Shot(Image.new('RGB', (1600, 900)), 1.2, 1920, 1080)
+    return agent_tools.Obs(shot, window, list(elements), False)
+
+
+class AgentToolTests(unittest.TestCase):
+    def setUp(self):
+        agent_tools.S.update(seq=0, current=None, obs={}, history=[], denied={}, approvals={})
+        self.tools = {}
+        fake = type('F', (), {'tool': lambda _s: (lambda f: self.tools.setdefault(f.__name__, f))})()
+        agent_tools.register(fake, lambda: None, lambda *a, **k: None, lambda a: a)
+
+    def test_name_match_needs_no_luna(self):
+        ob = make_obs(el(1, 'button', 'Songs', 100, 100), el(2, 'button', 'Spaces', 100, 200))
+        with mock.patch.object(decisions, 'call_decisions') as api:
+            r = agent_tools._locate('the Songs button', ob)
+        api.assert_not_called()
+        self.assertEqual((r['element_id'], r['by']), ('e1', 'name_match'))
+
+    def test_ambiguous_returns_candidates(self):
+        ob = make_obs(el(1, 'button', 'Save', 100, 100), el(2, 'button', 'Save', 300, 100))
+        pick = {'choice': 'e1', 'confidence': 0.5, 'refused': False,
+                'top': [{'value': 'e1', 'probability': 0.5}, {'value': 'e2', 'probability': 0.45}]}
+        with mock.patch.object(decisions, 'pick_element', return_value=pick):
+            r = agent_tools._locate('Save', ob)
+        self.assertEqual(r['code'], 'AMBIGUOUS')
+        self.assertEqual([c['element_id'] for c in r['candidates']], ['e1', 'e2'])
+
+    def test_grid_locate_maps_to_screen(self):
+        ob = make_obs()
+        answers = iter([{'visible': 0.9, 'col': 1, 'row': 2, 'confidence': 0.9, 'refused': False},
+                        {'visible': 0.9, 'col': 3, 'row': 2, 'confidence': 0.8, 'refused': False}])
+        with mock.patch.object(decisions, 'pick_grid', side_effect=lambda *a: next(answers)):
+            r = agent_tools._locate_grid('thing', ob)
+        # B3 = (100..200, 200..300); crop with margin (50..250, 150..350) zoomed 4x;
+        # sub-cell D3 centre (350, 333.3) -> image (137.5, 233.3) -> screen x1.2
+        self.assertEqual((r['x'], r['y'], r['by']), (165, 280, 'grid'))
+
+    def test_tiers(self):
+        ob = make_obs()
+        gen, songs = el(1, 'button', 'Generate', 1, 1), el(2, 'link', 'Songs', 1, 1)
+        known = {'by': 'element_id'}
+        self.assertEqual(agent_tools._tier('click', gen, known, ob, None, None, False), 'risky')
+        self.assertEqual(agent_tools._tier('click', songs, known, ob, None, None, False), 'low')
+        self.assertEqual(agent_tools._tier('keypress', None, {}, ob, None, ['ESCAPE'], False), 'low')
+        self.assertEqual(agent_tools._tier('keypress', None, {}, ob, None, ['ENTER'], False), 'risky')
+        self.assertEqual(agent_tools._tier('click', songs, {'by': 'grid'}, ob, None, None, False), 'risky')
+        term = make_obs(window=perception.Window('Windows PowerShell', 5, 0, 0, 10, 10))
+        self.assertEqual(agent_tools._tier('scroll', None, {}, term, None, None, False), 'risky')
+
+    def _act(self, elements, judge=None, **kw):
+        state = {'ob': make_obs(*elements)}
+
+        def observe(*a):
+            state['ob'] = make_obs(*elements)
+            return state['ob']
+        j = mock.Mock(side_effect=lambda *a, **k: decisions.Judgement(judge or 'allow', ['x']))
+        with mock.patch.object(agent_tools, '_observe', side_effect=observe), \
+                mock.patch.object(decisions, 'judge', j), \
+                mock.patch.object(perception, 'foreground_hwnd', return_value=77), \
+                mock.patch.object(perception, 'hit_test', return_value={'hwnd': 77}), \
+                mock.patch.object(desktop, 'wait_stable'), \
+                mock.patch.object(desktop, 'execute') as ex:
+            obs = make_obs(*elements).id
+            out = self.tools['act']('goal', obs=obs, **kw)
+        return json.loads(out[0]), ex, j
+
+    def test_low_risk_click_skips_judge(self):
+        res, ex, j = self._act([el(1, 'link', 'Songs', 300, 200)], element_id='e1')
+        j.assert_not_called()
+        ex.assert_called_once()
+        self.assertEqual((res['status'], res['judge']['tier']), ('done', 'low'))
+        self.assertEqual(res['elements'], ['e1 link "Songs" (300,200)'])
+
+    def test_type_submit_clicks_types_enters(self):
+        res, ex, j = self._act([el(1, 'textbox', 'Search', 300, 200)], judge='allow',
+                               action='type', element_id='e1', text='hi', submit=True)
+        j.assert_called_once()                      # submit makes it risky
+        self.assertEqual([c.args[0]['type'] for c in ex.call_args_list], ['click', 'type', 'keypress'])
+
+    def test_confirm_then_approval_id(self):
+        gen = el(1, 'button', 'Generate', 300, 200)
+        res, ex, _ = self._act([gen], judge='confirm', element_id='e1')
+        ex.assert_not_called()
+        self.assertEqual(res['error']['code'], 'NEEDS_APPROVAL')
+        res2, ex2, j2 = self._act([gen], judge='confirm', element_id='e1',
+                                  approval_id=res['approval_id'])
+        j2.assert_not_called()
+        ex2.assert_called_once()
+        self.assertTrue(res2['executed'])
+
+    def test_deny_is_sticky(self):
+        gen = el(1, 'button', 'Delete all', 300, 200)
+        res, ex, _ = self._act([gen], judge='deny', element_id='e1')
+        self.assertEqual(res['error']['code'], 'DENIED')
+        res2, ex2, j2 = self._act([gen], judge='allow', element_id='e1')
+        j2.assert_not_called()
+        ex2.assert_not_called()
+        self.assertEqual(res2['error']['code'], 'DENIED')
+
+    def test_stale_element(self):
+        old = make_obs(el(1, 'button', 'Gone', 300, 200))
+        with mock.patch.object(agent_tools, '_observe', return_value=make_obs()), \
+                mock.patch.object(perception, 'foreground_hwnd', return_value=77), \
+                mock.patch.object(desktop, 'execute') as ex:
+            res = json.loads(self.tools['act']('g', element_id='e1', obs=old.id)[0])
+        ex.assert_not_called()
+        self.assertEqual(res['error']['code'], 'STALE')
+
+    def test_focus_lost(self):
+        ob = make_obs(el(1, 'link', 'Songs', 300, 200))
+        with mock.patch.object(agent_tools, '_observe', return_value=ob), \
+                mock.patch.object(perception, 'foreground_hwnd', return_value=999), \
+                mock.patch.object(desktop, 'execute') as ex:
+            res = json.loads(self.tools['act']('g', element_id='e1', obs=ob.id)[0])
+        ex.assert_not_called()
+        self.assertEqual(res['error']['code'], 'FOCUS_LOST')
+
+    def test_exec_disabled_spends_no_luna(self):
+        tools = {}
+        fake = type('F', (), {'tool': lambda _s: (lambda f: tools.setdefault(f.__name__, f))})()
+        agent_tools.register(fake, lambda: 'disabled', lambda *a, **k: None, lambda a: a)
+        ob = make_obs(el(1, 'button', 'Generate', 300, 200))
+        with mock.patch.object(agent_tools, '_observe', return_value=ob), \
+                mock.patch.object(perception, 'foreground_hwnd', return_value=77), \
+                mock.patch.object(decisions, 'call_decisions') as api:
+            res = json.loads(tools['act']('g', element_id='e1', obs=ob.id)[0])
+        api.assert_not_called()
+        self.assertEqual(res['error']['code'], 'EXEC_DISABLED')
+
+    def test_hidden_control_chars_and_double_click_are_risky(self):
+        ob = make_obs()
+        box, item = el(1, 'textbox', 'Name', 1, 1), el(2, 'listitem', 'setup.exe', 1, 1)
+        k = {'by': 'element_id'}
+        self.assertEqual(agent_tools._tier('type', box, k, ob, 'del *' + chr(13), None, False),
+                         'risky')
+        self.assertEqual(agent_tools._tier('type', box, k, ob, 'hello', None, False), 'low')
+        self.assertEqual(agent_tools._tier('double_click', item, k, ob, None, None, False), 'risky')
+        self.assertTrue(agent_tools._risky_element(el(3, 'button', '', 1, 1)))      # unnamed icon
+        self.assertTrue(agent_tools._risky_element(el(4, 'button', '傳送', 1, 1)))
+
+    def test_keys_bind_payload(self):
+        a = agent_tools._key(77, 'keypress', None, None, False, ['ENTER'], None)
+        b = agent_tools._key(77, 'keypress', None, None, False, ['ALT', 'F4'], None)
+        c = agent_tools._key(77, 'type', ('textbox', 'x', ''), 'hi', True, None, None)
+        d = agent_tools._key(77, 'type', ('textbox', 'x', ''), 'bye', True, None, None)
+        self.assertEqual(len({a, b, c, d}), 4)
+
+    def test_overlay_under_pointer_forces_judge(self):
+        songs = el(1, 'link', 'Songs', 300, 200)
+        state = {}
+
+        def observe(*a):
+            state['ob'] = make_obs(songs)
+            return state['ob']
+        j = mock.Mock(return_value=decisions.Judgement('allow', ['x']))
+        with mock.patch.object(agent_tools, '_observe', side_effect=observe),                 mock.patch.object(decisions, 'judge', j),                 mock.patch.object(perception, 'foreground_hwnd', return_value=77),                 mock.patch.object(perception, 'hit_test',
+                                  return_value={'hwnd': 77, 'name': 'Delete', 'role': 'button'}),                 mock.patch.object(desktop, 'wait_stable'), mock.patch.object(desktop, 'execute'):
+            obs = make_obs(songs).id
+            res = json.loads(self.tools['act']('g', obs=obs, element_id='e1')[0])
+        j.assert_called_once()
+        self.assertEqual(res['judge']['tier'], 'risky')
+
+    def test_duplicate_names_resolve_by_order_or_stale(self):
+        rows = [el(i, 'button', 'Delete', 500, 100 * i) for i in (1, 2, 3)]
+        ref = make_obs(*rows)
+        same = make_obs(*[el(i, 'button', 'Delete', 500, 100 * i) for i in (1, 2, 3)])
+        self.assertEqual(agent_tools._reresolve(ref, ref.elements['e2'], same).y, 200)
+        inserted = make_obs(*[el(i, 'button', 'Delete', 500, 100 * i) for i in (1, 2, 3, 4)])
+        self.assertIsNone(agent_tools._reresolve(ref, ref.elements['e2'], inserted))
+
+    def test_password_text_not_sent_to_judge(self):
+        res, ex, j = self._act([perception.Element('e1', 'textbox', 'Password', 300, 200, 290, 195,
+                                                   310, 205, password=True)],
+                               action='type', element_id='e1', text='hunter2')
+        sent = j.call_args.args[1]['text']
+        self.assertNotIn('hunter2', sent)
+        self.assertEqual([c.args[0].get('text') for c in ex.call_args_list][-1], 'hunter2')
+
+    def test_post_check_failure_still_reports_executed(self):
+        with mock.patch.object(decisions, 'assess', side_effect=TimeoutError):
+            res, ex, _ = self._act([el(1, 'link', 'Songs', 300, 200)], element_id='e1',
+                                   expect='Songs are listed')
+        ex.assert_called_once()
+        self.assertTrue(res['executed'])
+        self.assertIn('post-check failed', res['warning'])
+
+    def test_next_step_plan_shape(self):
+        ob = make_obs(el(1, 'textbox', 'Prompt', 300, 200))
+        r = {'choice': 'type:e1', 'confidence': 0.8, 'refused': False, 'expect': None,
+             'top': [{'value': 'type:e1', 'probability': 0.8}, {'value': 'key:enter', 'probability': 0.1}],
+             'state': {'goal_done': 0.1, 'loading': 0.0, 'blocking_dialog': 0.0}}
+        with mock.patch.object(agent_tools, '_observe', return_value=ob), \
+                mock.patch.object(decisions, 'next_step', return_value=r):
+            plan = self.tools['next_step']('write a song')
+        self.assertEqual(plan['decision'], 'act')
+        self.assertTrue(plan['confident'])
+        self.assertEqual(plan['suggestions'][0]['call']['args'],
+                         {'obs': ob.id, 'goal': 'write a song', 'action': 'type',
+                          'element_id': 'e1', 'text': '<TEXT>'})
 
 
 if __name__ == '__main__':

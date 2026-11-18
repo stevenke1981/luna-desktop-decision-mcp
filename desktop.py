@@ -27,29 +27,48 @@ MAX_WIDTH = int(os.environ.get('LUNA_SCREENSHOT_MAX_WIDTH', '1600'))
 
 @dataclass
 class Shot:
-    image: Image.Image   # possibly downscaled
+    image: Image.Image   # possibly downscaled and/or cropped
     scale: float         # screen pixels per image pixel
     width: int           # screen width
     height: int          # screen height
+    ox: float = 0.0      # screen position of the image's top-left corner
+    oy: float = 0.0
 
     def to_screen(self, x: float, y: float) -> tuple[int, int]:
-        return round(x * self.scale), round(y * self.scale)
+        return round(x * self.scale + self.ox), round(y * self.scale + self.oy)
 
     def to_image(self, x: float, y: float) -> tuple[float, float]:
-        return x / self.scale, y / self.scale
+        return (x - self.ox) / self.scale, (y - self.oy) / self.scale
+
+    def crop(self, left: float, top: float, right: float, bottom: float) -> 'Shot':
+        """Sub-shot of a screen rectangle (e.g. one window); same scale."""
+        l, t = self.to_image(max(left, 0), max(top, 0))
+        r, b = self.to_image(min(right, self.width), min(bottom, self.height))
+        l, t = max(0, int(l)), max(0, int(t))
+        r, b = min(self.image.width, int(r)), min(self.image.height, int(b))
+        if r - l < 8 or b - t < 8:
+            return self
+        img = self.image.crop((l, t, r, b))
+        return Shot(img, self.scale, self.width, self.height,
+                    self.ox + l * self.scale, self.oy + t * self.scale)
 
 
 def capture(max_width: int = MAX_WIDTH) -> Shot:
     import mss
-    with mss.mss() as sct:
-        mon = sct.monitors[1]
-        raw = sct.grab(mon)
+    with (mss.MSS() if hasattr(mss, 'MSS') else mss.mss()) as sct:
+        raw = sct.grab(_primary(sct))
     img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
     scale = 1.0
     if max_width and img.width > max_width:
         scale = img.width / max_width
         img = img.resize((max_width, round(img.height / scale)), Image.LANCZOS)
     return Shot(img, scale, raw.size[0], raw.size[1])
+
+
+def _primary(sct) -> dict:
+    """The primary monitor sits at (0, 0); monitors[1] is not guaranteed to be it."""
+    return next((m for m in sct.monitors[1:] if m['left'] == 0 and m['top'] == 0),
+                sct.monitors[1])
 
 
 def annotate(shot: Shot, action: dict) -> Image.Image:
@@ -63,21 +82,51 @@ def annotate(shot: Shot, action: dict) -> Image.Image:
         for x, y in (pts[0], pts[-1]):
             draw.ellipse((x - r / 2, y - r / 2, x + r / 2, y + r / 2), outline=(255, 0, 0), width=3)
     elif action.get('x') is not None and action.get('y') is not None:
+        # ring + ticks that stop short of the target, so the target stays readable
         x, y = shot.to_image(action['x'], action['y'])
-        draw.ellipse((x - r, y - r, x + r, y + r), outline=(255, 0, 0), width=3)
-        draw.line((x - 2 * r, y, x + 2 * r, y), fill=(255, 0, 0), width=2)
-        draw.line((x, y - 2 * r, x, y + 2 * r), fill=(255, 0, 0), width=2)
+        R = r * 1.6
+        draw.ellipse((x - R, y - R, x + R, y + R), outline=(255, 0, 0), width=3)
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            draw.line((x + dx * R, y + dy * R, x + dx * 2.4 * r, y + dy * 2.4 * r),
+                      fill=(255, 0, 0), width=3)
     return img
 
 
-def to_data_url(img: Image.Image, fmt: str = 'PNG') -> str:
+IMAGE_FORMAT = os.environ.get('LUNA_IMAGE_FORMAT', 'JPEG').upper()
+
+
+def to_data_url(img: Image.Image, fmt: str | None = None) -> str:
+    fmt = (fmt or IMAGE_FORMAT).upper()
     return f'data:image/{fmt.lower()};base64,' + base64.b64encode(to_bytes(img, fmt)).decode()
 
 
 def to_bytes(img: Image.Image, fmt: str = 'PNG') -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format=fmt)
+    if fmt.upper() in ('JPEG', 'JPG'):
+        img.convert('RGB').save(buf, format='JPEG', quality=85)
+    else:
+        img.save(buf, format=fmt)
     return buf.getvalue()
+
+
+def wait_stable(timeout: float = 2.0, interval: float = 0.12, tolerance: float = 1.5) -> float:
+    """Return once two consecutive small grey frames are nearly equal (UI settled),
+    or at timeout. The tolerance ignores small animations (spinners, waveforms)."""
+    import mss
+    from PIL import ImageChops, ImageStat
+    start = time.time()
+    prev = None
+    time.sleep(0.3)               # let navigation / re-render start before comparing frames
+    with (mss.MSS() if hasattr(mss, 'MSS') else mss.mss()) as sct:
+        mon = _primary(sct)
+        while time.time() - start < timeout:
+            raw = sct.grab(mon)
+            small = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX').convert('L').resize((96, 54))
+            if prev is not None and ImageStat.Stat(ImageChops.difference(small, prev)).mean[0] < tolerance:
+                break
+            prev = small
+            time.sleep(interval)
+    return time.time() - start
 
 
 def _pt(p) -> tuple[float, float]:
@@ -148,10 +197,12 @@ def execute(action: dict) -> None:
         pyautogui.mouseUp(button=button)
     elif kind == 'scroll':
         pyautogui.moveTo(action['x'], action['y'])
+        # pyautogui passes the raw wheel delta on Windows: one notch = 120
+        notch = 120 if sys.platform == 'win32' else 1
         if action.get('scroll_y'):
-            pyautogui.scroll(-int(action['scroll_y']))   # positive scroll_y = down
+            pyautogui.scroll(-int(action['scroll_y']) * notch)   # positive scroll_y = down
         if action.get('scroll_x'):
-            pyautogui.hscroll(int(action['scroll_x']))
+            pyautogui.hscroll(int(action['scroll_x']) * notch)
     elif kind == 'type':
         _type_text(action['text'])
     elif kind == 'keypress':
@@ -161,12 +212,17 @@ def execute(action: dict) -> None:
 
 
 def _type_text(text: str) -> None:
+    """Single-line text: Unicode SendInput (works under a CJK IME, no clipboard).
+    Multi-line text: clipboard paste, so newlines never press Enter (which would
+    submit chat-style boxes), then restore the previous clipboard text."""
     import pyautogui
-    if text.isascii():
-        pyautogui.write(text, interval=0.01)
+    text = text.replace('\r\n', '\n').replace('\r', '\n')   # a bare CR would press Enter
+    if '\n' not in text:
+        if sys.platform == 'win32':
+            _send_unicode(text)
+        else:
+            pyautogui.write(text, interval=0.01)
         return
-    # Non-ASCII (e.g. Chinese) cannot be typed key by key: paste via clipboard,
-    # then restore the previous clipboard text.
     import pyperclip
     try:
         previous = pyperclip.paste()
@@ -177,3 +233,39 @@ def _type_text(text: str) -> None:
     time.sleep(0.2)
     if previous is not None:
         pyperclip.copy(previous)
+
+
+def _send_unicode(text: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+    KEYEVENTF_UNICODE, KEYEVENTF_KEYUP = 0x0004, 0x0002
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [('wVk', wintypes.WORD), ('wScan', wintypes.WORD),
+                    ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('dwExtraInfo', ctypes.c_size_t)]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [('dx', wintypes.LONG), ('dy', wintypes.LONG), ('mouseData', wintypes.DWORD),
+                    ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('dwExtraInfo', ctypes.c_size_t)]
+
+    class _U(ctypes.Union):           # sized by MOUSEINPUT: correct on 32- and 64-bit
+        _fields_ = [('ki', KEYBDINPUT), ('mi', MOUSEINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [('type', wintypes.DWORD), ('u', _U)]
+
+    data = text.encode('utf-16-le')
+    events = []
+    for i in range(0, len(data), 2):
+        code = int.from_bytes(data[i:i + 2], 'little')
+        for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+            inp = INPUT(type=1)
+            inp.u.ki = KEYBDINPUT(0, code, flags, 0, 0)
+            events.append(inp)
+    if events:
+        arr = (INPUT * len(events))(*events)
+        sent = ctypes.windll.user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+        if sent != len(events):
+            raise OSError('SendInput was blocked (target window may be elevated / UIPI)')
