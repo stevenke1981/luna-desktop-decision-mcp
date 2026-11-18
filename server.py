@@ -23,7 +23,19 @@ from mcp.server.fastmcp import FastMCP, Image
 import decisions
 import desktop
 
+import logging
+
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 server = FastMCP('luna-desktop-decision')
+
+# The lower-level tools below are hidden by default: weaker agents do best with
+# the small observe / act / next_step / locate / focus_window surface.
+LEGACY = os.environ.get('LUNA_LEGACY_TOOLS') == '1'
+
+
+def _legacy(fn):
+    return server.tool()(fn) if LEGACY else fn
 
 STATE = {'http': False}
 AUDIT_PATH = Path(os.environ.get(
@@ -70,7 +82,7 @@ def _execution_enabled() -> str | None:
     return None
 
 
-@server.tool()
+@_legacy
 def capture_screen(max_width: int = desktop.MAX_WIDTH) -> list:
     """Screenshot of the primary monitor. Returns the image and its metadata.
 
@@ -83,13 +95,13 @@ def capture_screen(max_width: int = desktop.MAX_WIDTH) -> list:
     return [Image(data=desktop.to_bytes(shot.image), format='png'), json.dumps(meta)]
 
 
-@server.tool()
+@_legacy
 def judge_desktop_action(goal: str, action: dict, coordinate_space: str = 'screen',
                          history: list[str] | None = None) -> dict:
     """Ask gpt-6-luna (OpenAI Decisions API) whether a desktop action should run now.
 
-    Call this BEFORE performing any click/type/keypress on the user's desktop,
-    whatever tool you use to perform it. A fresh screenshot with the target
+    For agents that use their OWN input tool: call this before a risky
+    click/type/keypress. (If you use act(), it already judges risky steps.) A fresh screenshot with the target
     marked is sent to OpenAI (billable, leaves the machine).
 
     action: {"type": click|double_click|right_click|move|drag|scroll|type|keypress|wait,
@@ -111,7 +123,7 @@ def judge_desktop_action(goal: str, action: dict, coordinate_space: str = 'scree
     return result
 
 
-@server.tool()
+@_legacy
 def choose_desktop_action(goal: str, candidates: list[dict],
                           coordinate_space: str = 'screen') -> dict:
     """Ask gpt-6-luna which candidate action is the best next step on the current screen.
@@ -129,7 +141,7 @@ def choose_desktop_action(goal: str, candidates: list[dict],
     return result
 
 
-@server.tool()
+@_legacy
 def check_screen(conditions: list[str], context: str | None = None) -> dict:
     """Evaluate yes/no conditions about the current screen with gpt-6-luna.
 
@@ -142,7 +154,7 @@ def check_screen(conditions: list[str], context: str | None = None) -> dict:
     return decisions.check_conditions(conditions, desktop.to_data_url(shot.image), context)
 
 
-@server.tool()
+@_legacy
 def perform_desktop_action(goal: str, action: dict, coordinate_space: str = 'screen',
                            user_approved: bool = False,
                            history: list[str] | None = None) -> list:
@@ -157,6 +169,8 @@ def perform_desktop_action(goal: str, action: dict, coordinate_space: str = 'scr
     a screenshot taken after the action.
     """
     blocked = _execution_enabled()
+    if blocked:          # do not spend a Luna call (or send the screen) for nothing
+        return [json.dumps({'executed': False, 'note': blocked})]
     shot = desktop.capture()
     a = _to_screen(action, shot, coordinate_space)
     desktop.validate(a, shot)
@@ -165,21 +179,28 @@ def perform_desktop_action(goal: str, action: dict, coordinate_space: str = 'scr
     confirm_policy = os.environ.get('LUNA_CONFIRM_POLICY', 'approve')  # approve | never
     run = (j.verdict == 'allow' or
            (j.verdict == 'confirm' and user_approved and confirm_policy != 'never'))
-    if blocked:
-        result.update(executed=False, note=blocked)
-    elif not run:
+    if not run:
         result.update(executed=False, note='not executed: ' + (
             'denied' if j.verdict == 'deny' else 'needs explicit user approval'))
     else:
-        desktop.execute(a)
-        time.sleep(float(os.environ.get('LUNA_SETTLE_SECONDS', '0.6')))
-        result['executed'] = True
+        result['executed'] = False
+        try:
+            desktop.execute(a)
+            result['executed'] = True
+        finally:
+            _audit('perform_exec', action=_redact(a), executed=result['executed'])
+        desktop.wait_stable(2.0)
     _audit('perform', goal=goal, action=_redact(a), verdict=j.verdict,
            user_approved=user_approved, executed=result['executed'])
     out: list = [json.dumps(result, ensure_ascii=False)]
     if result['executed']:
         out.insert(0, Image(data=desktop.to_bytes(desktop.capture().image), format='png'))
     return out
+
+
+import agent_tools  # noqa: E402  (observe / locate / next_step / act / focus_window)
+
+agent_tools.register(server, _execution_enabled, _audit, _redact)
 
 
 class TokenAuth:

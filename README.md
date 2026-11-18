@@ -1,39 +1,41 @@
 # Luna Desktop Decision MCP
 
-讓任何 MCP agent（Codex、ChatGPT 桌面版、Claude Code、Cursor…）在操作桌面**之前**，先用 OpenAI **Decisions API**（`POST /v1/decisions`，模型 `gpt-6-luna`）判斷這個操作該不該做。
+讓任何 MCP agent（Codex、ChatGPT 桌面版、Claude Code、小模型…）**快速又安全地操作 Windows 桌面**。
+判斷交給 OpenAI **Decisions API**（`POST /v1/decisions`，模型 `gpt-6-luna`，約比 Responses API 快 10 倍、輸出不計費）。
 
-流程：擷取主螢幕 → 在目標座標畫紅色十字 → 送 Decisions 問一組型別化問題（choice / predicate / score）→ 本地依門檻算出 `allow` / `confirm` / `deny`。Decisions 不回傳理由，所以原始機率會一併回傳以供稽核。
+Decisions 只回傳型別化答案（choice／predicate／score），不會回文字或座標。所以由伺服器把畫面轉成「可以選的東西」：
 
-## 工具
+1. **UI Automation** 列出前景視窗的可點元素（名稱、類型、精確座標）——本機、0.3–0.6 秒、免費。
+2. **先在本機比對名稱**；只有比對不出唯一結果時才請 Luna 在候選元素中選（choice）。
+3. 看不到元素時改用**格線**：Luna 選欄、選列 → 放大再選 → 換算成座標。
+4. 回應給 agent 的是**可直接呼叫的參數**（`next`）與**狀態碼**，能力較弱的 agent 照著做就行。
 
-| 工具 | 用途 |
-|---|---|
-| `capture_screen` | 主螢幕截圖（含 `scale`：screen = image × scale） |
-| `judge_desktop_action` | 判斷單一操作：`allow` / `confirm`（先問使用者）/ `deny` |
-| `choose_desktop_action` | 從多個候選操作中選最佳下一步（或 `none`） |
-| `check_screen` | 對目前畫面評估是非條件（如「另存新檔對話框已開啟」），用來驗證操作結果 |
-| `perform_desktop_action` | 先判斷，`allow` 才執行；`confirm` 需 `user_approved=true`；`deny` 永不執行。預設關閉 |
+## 工具（預設 5 個）
 
-操作格式（與 OpenAI computer-use 動作相近）：
+| 工具 | 用途 | Luna 呼叫 |
+|---|---|---|
+| `focus_window(title_contains)` | 把指定視窗帶到最前面 | 0 |
+| `observe()` | 列出前景視窗元素：`e12 button "Songs" (186,413)`；`include_image=true` 附標號截圖 | 0 |
+| `locate(target)` | 用描述找元素（名稱比對 → Luna 選元素 → 格線） | 0–3 |
+| `next_step(goal)` | Luna 選下一步；回傳 `decision`（act/wait/done/ask_user）與可直接呼叫的 `act` 參數 | 1 |
+| `act(goal, action, element_id/obs 或 target 或 x/y, …)` | 一次完成：定位 → 安全判斷 → 執行 → 驗證 `expect` → 回傳新畫面元素；`plan_next=true` 同時給下一步 | 0–1（+定位） |
 
-```json
-{"type": "click", "x": 960, "y": 540, "button": "left", "description": "工具列的「儲存」按鈕"}
-{"type": "type", "text": "你好"}            // 非 ASCII 走剪貼簿貼上
-{"type": "keypress", "keys": ["CTRL", "S"]}
-{"type": "drag", "path": [[100, 100], [400, 300]]}
-{"type": "scroll", "x": 800, "y": 500, "scroll_y": 5}
-```
+舊的低階工具（`judge_desktop_action`、`perform_desktop_action`、`check_screen`、`choose_desktop_action`、`capture_screen`）需設 `LUNA_LEGACY_TOOLS=1` 才會出現。
 
-座標預設是主螢幕實體像素（`coordinate_space: "screen"`）；若用 `capture_screen` 圖上的座標，傳 `coordinate_space: "image"`。
+### `act` 的狀態碼
 
-### 判斷問題與門檻
+`done`、`expect_failed`、`needs_approval`（回傳 `approval_id`，使用者同意後用**同樣參數**加上它再呼叫）、`denied`（同一畫面上會一直拒絕，不要改寫重試）、`ambiguous`（附 `candidates`）、`not_found`、`stale`、`focus_lost`、`occluded`、`exec_disabled`。每個錯誤都有 `error.fix` 告訴 agent 下一步。
 
-- `verdict`（choice：allow / confirm / deny）、`goal_aligned`、`irreversible`、`sensitive`、`blocking_dialog`、`target_visible`（僅指標類操作）、`risk`（score：low→critical）
-- `deny` 機率 ≥ `LUNA_DENY_THRESHOLD`（0.5）或模型拒答 → **deny**
-- verdict 非 allow、信心 < 0.5、不可逆 ≥ 0.4、敏感 ≥ 0.4、阻擋對話框 ≥ 0.6、目標對不上 < 0.5、目標不在 < 0.5、risk ≥ high → **confirm**
-- 其餘 → **allow**
+### 速度與安全的取捨
 
-所有門檻都可用環境變數調整（見 `decisions.py` 的 `Thresholds`）。
+- **低風險步驟不判斷**（捲動、Esc/Tab/方向鍵、點一般連結／分頁／欄位、輸入不送出）→ 0 次 Luna。
+- **高風險一律判斷**：名稱含 send/submit/delete/pay/buy/generate/install/送出/刪除/付款/購買/產生/安裝…、密碼欄、Enter 或送出、終端機視窗、網址列、格線或座標定位的未知目標。`LUNA_JUDGE=always` 可改成每步都判斷。
+- 判斷用的動作描述由**伺服器依 UIA 名稱產生**，不採用 agent 的文字，避免換句話說繞過；被 `deny` 的動作在畫面未變前會直接拒絕。
+- 執行前檢查前景視窗與滑鼠下的元素（UIA hit-test），被遮住或失焦就回 `occluded`／`focus_lost`，不會點錯視窗。
+- 送給 Luna 的截圖只裁切目標視窗（不含 agent 自己的終端機），並以 JPEG 傳送。
+- 畫面文字一律視為**不可信資料**：清除控制字元、截斷長度，並在回應中標記 `untrusted_text`。
+
+實測（Chrome + Flow Music）：`observe` 0.56 秒、`next_step` 1.3 秒（1 次 Luna）、名稱可直接比對的點擊 0 次 Luna。
 
 ## 安裝
 
@@ -50,12 +52,15 @@ python -m venv .venv
 | 變數 | 預設 | 說明 |
 |---|---|---|
 | `OPENAI_API_KEY` | — | 必填 |
-| `LUNA_ALLOW_EXECUTE` | 未設 | 設 `1` 才允許 `perform_desktop_action` 真的動滑鼠鍵盤 |
+| `LUNA_ALLOW_EXECUTE` | 未設 | 設 `1` 才會真的動滑鼠鍵盤（未設時 `act` 回 `exec_disabled`，且不呼叫 Luna） |
 | `LUNA_HTTP_ALLOW_EXECUTE` | 未設 | HTTP 模式下再額外設 `1` 才可執行 |
-| `LUNA_CONFIRM_POLICY` | `approve` | `never` = `confirm` 判定一律不執行，即使 agent 聲稱已核准 |
+| `LUNA_JUDGE` | `risky` | `always` = 每步都判斷 |
+| `LUNA_CONFIRM_POLICY` | `approve` | 舊工具用；`never` = `confirm` 一律不執行 |
+| `LUNA_LEGACY_TOOLS` | 未設 | `1` = 也提供舊的低階工具 |
+| `LUNA_LOCATE_MIN_CONFIDENCE` / `LUNA_LOCATE_MIN_MARGIN` | `0.6` / `0.25` | Luna 選元素時的最低機率與領先差距，不足則回 `ambiguous` |
 | `LUNA_MCP_TOKEN` | — | HTTP 模式必填，≥ 24 字元隨機字串 |
-| `LUNA_SCREENSHOT_MAX_WIDTH` | `1600` | 截圖縮放寬度（影響 token 成本） |
-| `LUNA_IMAGE_DETAIL` | `high` | `low` / `high` / `auto` / `original` |
+| `LUNA_SCREENSHOT_MAX_WIDTH` | `1600` | 截圖縮放寬度 |
+| `LUNA_IMAGE_FORMAT` / `LUNA_IMAGE_DETAIL` | `JPEG` / `high` | 送給 Luna 的圖片格式與細節 |
 | `LUNA_AUDIT_LOG` | `~/.luna-desktop-decision/audit.jsonl` | `off` 關閉；輸入文字只記長度 |
 
 ## 接到各 agent
@@ -70,20 +75,18 @@ command = 'C:\path\to\luna-desktop-decision-mcp\.venv\Scripts\python.exe'
 args = ['C:\path\to\luna-desktop-decision-mcp\server.py']
 env_vars = ["OPENAI_API_KEY"]          # 從父行程轉送；或改用 env = { OPENAI_API_KEY = "..." }
 tool_timeout_sec = 60
-# env = { LUNA_ALLOW_EXECUTE = "1" }   # 要讓 Codex 直接執行時才開
+env = { LUNA_ALLOW_EXECUTE = "1" }     # 要讓 agent 實際操作時才開
 ```
-
-或：`codex mcp add luna-desktop -- C:\path\to\luna-desktop-decision-mcp\.venv\Scripts\python.exe C:\path\to\luna-desktop-decision-mcp\server.py`
 
 ### Claude Code — stdio
 
 ```powershell
-claude mcp add luna-desktop -s user -e OPENAI_API_KEY=$env:OPENAI_API_KEY -- C:\path\to\luna-desktop-decision-mcp\.venv\Scripts\python.exe C:\path\to\luna-desktop-decision-mcp\server.py
+claude mcp add luna-desktop -s user -e OPENAI_API_KEY=$env:OPENAI_API_KEY -e LUNA_ALLOW_EXECUTE=1 -- C:\path\to\luna-desktop-decision-mcp\.venv\Scripts\python.exe C:\path\to\luna-desktop-decision-mcp\server.py
 ```
 
 ### ChatGPT 桌面版 — Streamable HTTP
 
-ChatGPT 的自訂連接器（設定 → Apps & Connectors → Advanced → Developer mode）只接受**遠端 HTTPS** MCP URL，所以要開 HTTP 模式並用通道公開：
+ChatGPT 自訂連接器（設定 → Apps & Connectors → Advanced → Developer mode）只接受**遠端 HTTPS** MCP URL：
 
 ```powershell
 $env:LUNA_MCP_TOKEN = -join ((48..57 + 97..122) | Get-Random -Count 40 | % {[char]$_})
@@ -91,20 +94,27 @@ $env:LUNA_MCP_TOKEN = -join ((48..57 + 97..122) | Get-Random -Count 40 | % {[cha
 cloudflared tunnel --url http://127.0.0.1:8765     # 或 ngrok http 8765
 ```
 
-連接器 URL 填 `https://<通道網域>/mcp?token=<LUNA_MCP_TOKEN>`，驗證方式選 No authentication（token 在 URL 中；也接受 `Authorization: Bearer`）。
-⚠️ 這等於把「看你螢幕」的能力公開到網路上：token 要保密、用完就關通道，HTTP 模式下建議**不要**開 `LUNA_HTTP_ALLOW_EXECUTE`，只用判斷工具。
+連接器 URL 填 `https://<通道網域>/mcp?token=<LUNA_MCP_TOKEN>`（也接受 `Authorization: Bearer`）。
+⚠️ 這等於把「看你螢幕」的能力公開到網路上：token 要保密、用完就關通道；沒有必要不要開 `LUNA_HTTP_ALLOW_EXECUTE`。
 
-### 其他 MCP 客戶端
+## 參考範例
 
-stdio：`python server.py`；HTTP：`python server.py --http` → `http://127.0.0.1:8765/mcp`（需 token）。
+- [`examples/AGENTS.md`](examples/AGENTS.md)：可直接貼給 agent 的使用規則、操作迴圈與呼叫範例。
+- [`examples/demo_client.py`](examples/demo_client.py)：用 Python MCP client 跑一次 `focus_window → observe → locate → next_step → act`。
 
-## 建議給 agent 的指示
+一個典型的回合（給能力較弱的 agent）：
 
-> 每次要點擊、輸入或按鍵操作桌面前，先呼叫 `judge_desktop_action`（附上 `description`）。`deny` 不要做；`confirm` 先向使用者說明並取得同意；做完後用 `check_screen` 驗證結果。
+```text
+next_step(goal="打開 Songs 清單")
+→ decision "act", suggestions[0].call = act(obs="o4", action="click", element_id="e59")
+act(obs="o4", goal=…, action="click", element_id="e59", expect="A list of songs is shown", plan_next=true)
+→ status "done"（或 expect_failed + decision "wait"），elements = 新畫面，next = 下一步可呼叫的參數
+```
 
 ## 注意事項
 
-- 每次判斷都會把截圖送到 OpenAI，會計費：實測一次判斷約 1,700 input tokens（$0.10 / 1M，輸出不計費）。畫面上有機密時請不要使用。
-- 判斷結果只是機率性建議，不能取代人工確認；`user_approved` 由 agent 填寫，無法驗證，高風險環境請設 `LUNA_CONFIRM_POLICY=never`。
-- 只支援主螢幕；需要中止時把滑鼠甩到螢幕角落（PyAutoGUI failsafe）。
-- 以系統管理員身分執行的視窗（UAC 提升權限）無法被一般權限的行程操作。
+- 需要 Luna 時會把**目標視窗的截圖**送到 OpenAI 並計費（實測一次判斷約 1,700 input tokens，$0.10 / 1M）。畫面上有機密時不要使用。
+- 判斷結果是機率性的建議，不能取代人工確認；高風險操作請讓使用者核准（`approval_id`）。
+- 只支援主螢幕。需要中止時把滑鼠甩到螢幕角落（PyAutoGUI failsafe）。
+- 以系統管理員身分執行的視窗（UAC 提升權限）無法被一般權限的行程操作；遠端桌面視窗內的元素 UIA 看不到，只能用格線。
+- 原生下拉選單、右鍵選單是獨立視窗，目前不會列入 `observe`（網頁內的選單可以）。
