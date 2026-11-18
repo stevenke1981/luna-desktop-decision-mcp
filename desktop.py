@@ -9,9 +9,13 @@ from __future__ import annotations
 import base64
 import io
 import os
+import struct
 import sys
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
+from typing import Literal
 
 if sys.platform == 'win32':  # must run before pyautogui/mss read metrics
     try:
@@ -174,7 +178,23 @@ def validate(action: dict, shot: Shot | None = None) -> None:
                                  f'{shot.width}x{shot.height}')
 
 
-def execute(action: dict) -> None:
+class FocusLost(RuntimeError):
+    """The original input target no longer has focus."""
+
+
+class TextDeliveryUnknown(RuntimeError):
+    """Some or all of the text may already have reached the target."""
+
+
+@dataclass(frozen=True)
+class TextDelivery:
+    status: Literal['verified', 'dispatched']
+    focus: tuple[int, int] | None
+
+
+def execute(action: dict, *, expected_hwnd: int = 0,
+            expected_focus: tuple[int, int] | None = None,
+            native_edit: bool = False) -> TextDelivery | None:
     import pyautogui
     pyautogui.FAILSAFE = True   # slam the mouse into a corner to abort
     pyautogui.PAUSE = 0.05
@@ -204,38 +224,66 @@ def execute(action: dict) -> None:
         if action.get('scroll_x'):
             pyautogui.hscroll(int(action['scroll_x']) * notch)
     elif kind == 'type':
-        _type_text(action['text'])
+        point = (action['x'], action['y']) if native_edit else None
+        return _type_text(action['text'], expected_hwnd, point)
     elif kind == 'keypress':
+        if expected_focus is not None:
+            from win_text import foreground_focus
+            if foreground_focus() != expected_focus:
+                raise FocusLost('The original text field no longer has keyboard focus.')
         pyautogui.hotkey(*[map_key(k) for k in action['keys']])
     elif kind == 'wait':
         time.sleep(min(float(action.get('seconds', 1)), 10))
 
 
-def _type_text(text: str) -> None:
-    """Single-line text: Unicode SendInput (works under a CJK IME, no clipboard).
-    Multi-line text: clipboard paste, so newlines never press Enter (which would
-    submit chat-style boxes), then restore the previous clipboard text."""
+def _type_text(text: str, expected_hwnd: int, point: tuple[int, int] | None) -> TextDelivery:
     import pyautogui
-    text = text.replace('\r\n', '\n').replace('\r', '\n')   # a bare CR would press Enter
+    focus = None
+    if sys.platform == 'win32':
+        from win_text import foreground_focus, insert_multiline
+        focus = foreground_focus()
+
+    def guard() -> None:
+        pyautogui.failSafeCheck()
+        if focus is not None and (not focus[1] or (expected_hwnd and focus[0] != expected_hwnd)
+                                  or foreground_focus() != focus):
+            raise FocusLost('The original text field no longer has keyboard focus.')
+
+    guard()
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
     if '\n' not in text:
-        if sys.platform == 'win32':
-            _send_unicode(text)
+        if focus is not None:
+            _send_unicode(text, guard)
         else:
             pyautogui.write(text, interval=0.01)
-        return
+        return TextDelivery('dispatched', focus)
+    if focus is not None and point is not None and insert_multiline(text, focus, point, guard):
+        return TextDelivery('verified', focus)
+
+    # Multiline input never sends Enter. Unknown controls consume a paste shortcut.
     import pyperclip
     try:
         previous = pyperclip.paste()
-    except Exception:
+    except pyperclip.PyperclipException:
         previous = None
+    guard()
     pyperclip.copy(text)
-    pyautogui.hotkey('ctrl', 'v')
-    time.sleep(0.2)
-    if previous is not None:
-        pyperclip.copy(previous)
+    try:
+        guard()
+        try:
+            pyautogui.hotkey('ctrl', 'v')
+        except Exception as exc:
+            raise TextDeliveryUnknown('The paste shortcut did not confirm text delivery.') from exc
+        time.sleep(0.2)
+    finally:
+        # Respect a new clipboard value copied while the paste was running.
+        with suppress(pyperclip.PyperclipException):
+            if previous is not None and pyperclip.paste() == text:
+                pyperclip.copy(previous)
+    return TextDelivery('dispatched', focus)
 
 
-def _send_unicode(text: str) -> None:
+def _send_unicode(text: str, guard: Callable[[], None]) -> None:
     import ctypes
     from ctypes import wintypes
     KEYEVENTF_UNICODE, KEYEVENTF_KEYUP = 0x0004, 0x0002
@@ -256,16 +304,18 @@ def _send_unicode(text: str) -> None:
     class INPUT(ctypes.Structure):
         _fields_ = [('type', wintypes.DWORD), ('u', _U)]
 
+    if not text:
+        return
     data = text.encode('utf-16-le')
-    events = []
-    for i in range(0, len(data), 2):
-        code = int.from_bytes(data[i:i + 2], 'little')
-        for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
-            inp = INPUT(type=1)
-            inp.u.ki = KEYBDINPUT(0, code, flags, 0, 0)
-            events.append(inp)
-    if events:
-        arr = (INPUT * len(events))(*events)
-        sent = ctypes.windll.user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
-        if sent != len(events):
-            raise OSError('SendInput was blocked (target window may be elevated / UIPI)')
+    events = (INPUT * len(data))()    # two events per two-byte UTF-16 code unit
+    for i, (code,) in enumerate(struct.iter_unpack('<H', data)):
+        for offset, flags in enumerate((KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)):
+            event = events[2 * i + offset]
+            event.type = 1
+            event.u.ki = KEYBDINPUT(0, code, flags, 0, 0)
+    guard()
+    sent = ctypes.windll.user32.SendInput(len(events), events, ctypes.sizeof(INPUT))
+    if sent == 0:
+        raise OSError('SendInput was blocked (target window may be elevated / UIPI)')
+    if sent != len(events):
+        raise TextDeliveryUnknown('SendInput queued only part of the text.')

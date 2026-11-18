@@ -22,7 +22,11 @@ Paste this into `AGENTS.md` (Codex), a project instruction (ChatGPT), `CLAUDE.md
    - `denied`: do not retry or reword. Try a different approach or ask the user.
    - `ambiguous`: pick one of the `candidates` by `element_id`.
    - `stale`, `not_found`: pick from the fresh `elements`, scroll, or close popups.
-   - `focus_lost`, `occluded`: call `focus_window` or press Escape, then retry.
+   - `focus_lost`, `occluded`: restore focus or clear the obstruction, then observe.
+     If the response reports `executed: true`, inspect the field and only submit
+     separately if needed.
+   - `text_delivery_unknown`, `submit_unknown`: inspect the field or submission
+     result before another action. Do not repeat the text.
    - `exec_disabled`: tell the user that execution is turned off.
 5. Stop and ask the user for logins, passwords, captchas, payments, or anything
    irreversible that they did not explicitly ask for.

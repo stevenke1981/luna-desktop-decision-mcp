@@ -2,8 +2,10 @@
 import asyncio
 import json
 import os
+import sys
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ['LUNA_AUDIT_LOG'] = 'off'
@@ -125,6 +127,119 @@ class DesktopTests(unittest.TestCase):
     def test_key_map(self):
         self.assertEqual([desktop.map_key(k) for k in ['CTRL', 'ArrowLeft', 'a']],
                          ['ctrl', 'left', 'a'])
+
+
+@unittest.skipUnless(sys.platform == 'win32', 'Windows input APIs')
+class WindowsTextTests(unittest.TestCase):
+    def test_unicode_batch_keeps_utf16_and_reports_partial_delivery(self):
+        import ctypes
+        captured = []
+
+        def send(count, events, _size):
+            captured.extend((event.u.ki.wScan, event.u.ki.dwFlags) for event in events)
+            return count - 1
+
+        guard = mock.Mock()
+        with mock.patch.object(ctypes.windll.user32, 'SendInput', side_effect=send) as api:
+            with self.assertRaises(desktop.TextDeliveryUnknown):
+                desktop._send_unicode('華🎷', guard)
+            api.assert_called_once()
+        self.assertEqual(captured, [(unit, flags) for unit in (0x83ef, 0xd83c, 0xdfb7)
+                                    for flags in (4, 6)])
+        guard.assert_called_once_with()
+
+    def test_paste_guard_avoids_other_windows_and_respects_new_clipboard_text(self):
+        import win_text
+        clipboard = SimpleNamespace(value='before')
+        clip = SimpleNamespace(paste=lambda: clipboard.value,
+                               copy=lambda value: setattr(clipboard, 'value', value),
+                               PyperclipException=RuntimeError)
+        keys = SimpleNamespace(failSafeCheck=mock.Mock(), hotkey=mock.Mock())
+        with mock.patch.dict(sys.modules, {'pyautogui': keys, 'pyperclip': clip}), \
+                mock.patch.object(win_text, 'foreground_focus',
+                                  side_effect=[(10, 20), (10, 20), (10, 20), (11, 21)]):
+            with self.assertRaises(desktop.FocusLost):
+                desktop._type_text('中\r\n文', 10, None)
+        keys.hotkey.assert_not_called()
+        self.assertEqual(clipboard.value, 'before')
+
+        with mock.patch.dict(sys.modules, {'pyautogui': keys, 'pyperclip': clip}), \
+                mock.patch.object(win_text, 'foreground_focus', return_value=(10, 20)), \
+                mock.patch.object(desktop.time, 'sleep', side_effect=lambda _: clip.copy('user copy')):
+            delivery = desktop._type_text('中\r\n文', 10, None)
+        keys.hotkey.assert_called_once_with('ctrl', 'v')
+        self.assertEqual(delivery.status, 'dispatched')
+        self.assertEqual(clipboard.value, 'user copy')
+
+    def test_native_edit_replaces_utf16_selection_in_one_write_and_reads_it_back(self):
+        import ctypes
+        import win_text
+        user = mock.Mock()
+        user.WindowFromPoint.return_value = 20
+        user.GetAncestor.return_value = 10
+        user.GetWindowLongW.return_value = win_text.ES_MULTILINE
+        user.GetClassNameW.side_effect = lambda _, value, _size: setattr(value, 'value', 'Edit')
+        message = mock.Mock()
+        sent = []
+
+        def send(hwnd, code, undo=0, value=0):
+            if code == win_text.EM_GETSEL:
+                return 3 | (7 << 16)  # A🎷[keep]Z in UTF-16 positions
+            sent.append((hwnd, code, undo, ctypes.wstring_at(value)))
+            return 0
+
+        message.side_effect = send
+        with mock.patch.object(win_text, '_user32', user), \
+                mock.patch.object(win_text, '_kernel32'), \
+                mock.patch.object(win_text, '_message', message), \
+                mock.patch.object(win_text, '_edit_text', side_effect=['A🎷keepZ', 'A🎷中文\r\nJazz 🎷Z']):
+            self.assertTrue(win_text.insert_multiline('中文\nJazz 🎷', (10, 20), (1, 2), mock.Mock()))
+        self.assertEqual(sent, [(20, win_text.EM_REPLACESEL, 1, '中文\r\nJazz 🎷')])
+
+    def test_native_edit_rejects_browser_non_edit_and_protected_targets(self):
+        import win_text
+        user = mock.Mock()
+        user.WindowFromPoint.return_value = 20
+        user.GetAncestor.return_value = 10
+        kernel = mock.Mock()
+        kernel.QueryFullProcessImageNameW.side_effect = (
+            lambda _, _flags, buffer, _size: setattr(buffer, 'value', r'C:\Browser\chrome.exe') or 1)
+        with mock.patch.object(win_text, '_user32', user), \
+                mock.patch.object(win_text, '_kernel32', kernel), \
+                mock.patch.object(win_text, '_message') as send:
+            for class_name, style in [('Chrome_RenderWidgetHostHWND', 4), ('Edit', 4 | 0x20),
+                                      ('Edit', 4 | 0x800), ('Edit', 4)]:
+                with self.subTest(class_name=class_name, style=style):
+                    user.GetClassNameW.side_effect = (
+                        lambda _, value, _size: setattr(value, 'value', class_name))
+                    user.GetWindowLongW.return_value = style
+                    self.assertFalse(win_text.insert_multiline('a\nb', (10, 20), (1, 2), mock.Mock()))
+        send.assert_not_called()
+
+    def test_native_edit_uncertainty_never_falls_through_to_clipboard(self):
+        import win_text
+        keys = SimpleNamespace(failSafeCheck=mock.Mock(), hotkey=mock.Mock())
+        with mock.patch.dict(sys.modules, {'pyautogui': keys}), \
+                mock.patch.object(win_text, 'foreground_focus', return_value=(10, 20)), \
+                mock.patch.object(win_text, 'insert_multiline',
+                                  side_effect=desktop.TextDeliveryUnknown('unknown result')) as native:
+            with self.assertRaises(desktop.TextDeliveryUnknown):
+                desktop._type_text('中文\nJazz', 10, (1, 2))
+        native.assert_called_once()
+        keys.hotkey.assert_not_called()
+
+    def test_native_edit_does_not_write_to_unfocused_target(self):
+        import win_text
+        user = mock.Mock()
+        user.WindowFromPoint.return_value = 20
+        user.GetAncestor.return_value = 10
+        user.GetWindowLongW.return_value = win_text.ES_MULTILINE
+        user.GetClassNameW.side_effect = lambda _, value, _size: setattr(value, 'value', 'Edit')
+        with mock.patch.object(win_text, '_user32', user), \
+                mock.patch.object(win_text, '_message') as send:
+            with self.assertRaises(desktop.FocusLost):
+                win_text.insert_multiline('a\nb', (10, 21), (1, 2), mock.Mock())
+        send.assert_not_called()
 
 
 class ServerTests(unittest.TestCase):
@@ -264,7 +379,7 @@ class AgentToolTests(unittest.TestCase):
         term = make_obs(window=perception.Window('Windows PowerShell', 5, 0, 0, 10, 10))
         self.assertEqual(agent_tools._tier('scroll', None, {}, term, None, None, False), 'risky')
 
-    def _act(self, elements, judge=None, **kw):
+    def _act(self, elements, judge=None, dispatch=None, settle=None, **kw):
         state = {'ob': make_obs(*elements)}
 
         def observe(*a):
@@ -275,8 +390,8 @@ class AgentToolTests(unittest.TestCase):
                 mock.patch.object(decisions, 'judge', j), \
                 mock.patch.object(perception, 'foreground_hwnd', return_value=77), \
                 mock.patch.object(perception, 'hit_test', return_value={'hwnd': 77}), \
-                mock.patch.object(desktop, 'wait_stable'), \
-                mock.patch.object(desktop, 'execute') as ex:
+                mock.patch.object(desktop, 'wait_stable', side_effect=settle), \
+                mock.patch.object(desktop, 'execute', side_effect=dispatch, return_value=None) as ex:
             obs = make_obs(*elements).id
             out = self.tools['act']('goal', obs=obs, **kw)
         return json.loads(out[0]), ex, j
@@ -290,9 +405,41 @@ class AgentToolTests(unittest.TestCase):
 
     def test_type_submit_clicks_types_enters(self):
         res, ex, j = self._act([el(1, 'textbox', 'Search', 300, 200)], judge='allow',
+                               dispatch=[None, desktop.TextDelivery('verified', (77, 20)), None],
                                action='type', element_id='e1', text='hi', submit=True)
         j.assert_called_once()                      # submit makes it risky
         self.assertEqual([c.args[0]['type'] for c in ex.call_args_list], ['click', 'type', 'keypress'])
+        self.assertEqual(ex.call_args_list[1].kwargs, {'expected_hwnd': 77, 'native_edit': True})
+        self.assertEqual(ex.call_args_list[2].kwargs, {'expected_focus': (77, 20)})
+        self.assertEqual(res['text_delivery'], 'verified')
+
+    def test_unknown_type_does_not_submit_or_replay(self):
+        res, ex, _ = self._act([el(1, 'textbox', 'Message', 300, 200)], judge='allow',
+                               dispatch=[None, desktop.TextDeliveryUnknown('unknown result')],
+                               action='type', element_id='e1', text='hi\nthere', submit=True)
+        self.assertEqual([c.args[0]['type'] for c in ex.call_args_list], ['click', 'type'])
+        self.assertEqual(res['status'], 'text_delivery_unknown')
+        self.assertIsNone(res['executed'])
+        self.assertIn('Do not repeat', res['error']['fix'])
+
+    def test_type_receipt_survives_focus_lost_before_submit(self):
+        res, ex, _ = self._act([el(1, 'textbox', 'Message', 300, 200)], judge='allow',
+                               dispatch=[None, desktop.TextDelivery('verified', (77, 20)),
+                                         desktop.FocusLost('focus changed')],
+                               action='type', element_id='e1', text='hi\nthere', submit=True)
+        self.assertEqual([c.args[0]['type'] for c in ex.call_args_list], ['click', 'type', 'keypress'])
+        self.assertEqual(res['status'], 'focus_lost')
+        self.assertTrue(res['executed'])
+        self.assertEqual(res['text_delivery'], 'verified')
+
+    def test_type_keeps_receipt_when_post_observation_fails(self):
+        res, ex, _ = self._act([el(1, 'textbox', 'Message', 300, 200)],
+                               dispatch=[None, desktop.TextDelivery('verified', (77, 20))],
+                               settle=TimeoutError, action='type', element_id='e1', text='hi\nthere')
+        self.assertEqual([c.args[0]['type'] for c in ex.call_args_list], ['click', 'type'])
+        self.assertTrue(res['executed'])
+        self.assertEqual(res['text_delivery'], 'verified')
+        self.assertEqual(res['next'][0]['tool'], 'observe')
 
     def test_preapproval_skips_confirm_but_not_deny(self):
         send = el(1, 'button', 'Send message', 300, 200)
@@ -419,6 +566,7 @@ class AgentToolTests(unittest.TestCase):
         sent = j.call_args.args[1]['text']
         self.assertNotIn('hunter2', sent)
         self.assertEqual([c.args[0].get('text') for c in ex.call_args_list][-1], 'hunter2')
+        self.assertFalse(ex.call_args.kwargs['native_edit'])
 
     def test_post_check_failure_still_reports_executed(self):
         with mock.patch.object(decisions, 'assess', side_effect=TimeoutError):

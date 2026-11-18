@@ -14,6 +14,7 @@ import argparse
 import hmac
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from mcp.server.fastmcp import FastMCP, Image
 
 import decisions
 import desktop
+import perception
 
 import logging
 
@@ -171,6 +173,8 @@ def perform_desktop_action(goal: str, action: dict, coordinate_space: str = 'scr
     blocked = _execution_enabled()
     if blocked:          # do not spend a Luna call (or send the screen) for nothing
         return [json.dumps({'executed': False, 'note': blocked})]
+    expected_hwnd = (perception.foreground_hwnd()
+                     if sys.platform == 'win32' and action.get('type') == 'type' else 0)
     shot = desktop.capture()
     a = _to_screen(action, shot, coordinate_space)
     desktop.validate(a, shot)
@@ -179,22 +183,37 @@ def perform_desktop_action(goal: str, action: dict, coordinate_space: str = 'scr
     confirm_policy = os.environ.get('LUNA_CONFIRM_POLICY', 'approve')  # approve | never
     run = (j.verdict == 'allow' or
            (j.verdict == 'confirm' and user_approved and confirm_policy != 'never'))
+    after = None
     if not run:
         result.update(executed=False, note='not executed: ' + (
             'denied' if j.verdict == 'deny' else 'needs explicit user approval'))
     else:
         result['executed'] = False
         try:
-            desktop.execute(a)
+            delivery = desktop.execute(a, expected_hwnd=expected_hwnd) if expected_hwnd else desktop.execute(a)
             result['executed'] = True
+            if a['type'] == 'type' and delivery is not None:
+                result['text_delivery'] = delivery.status
+        except desktop.FocusLost as exc:
+            result.update(status='focus_lost', note=str(exc))
+        except desktop.TextDeliveryUnknown as exc:
+            result.update(executed=None, status='text_delivery_unknown',
+                          note=f'{exc} Inspect the field before taking another action. Do not repeat the text.')
         finally:
             _audit('perform_exec', action=_redact(a), executed=result['executed'])
-        desktop.wait_stable(2.0)
+        if result['executed']:
+            try:
+                desktop.wait_stable(2.0)
+                after = Image(data=desktop.to_bytes(desktop.capture().image), format='png')
+            except Exception as exc:
+                if a['type'] != 'type':
+                    raise
+                result['warning'] = f'post-observation failed ({type(exc).__name__}); the text was sent'
     _audit('perform', goal=goal, action=_redact(a), verdict=j.verdict,
            user_approved=user_approved, executed=result['executed'])
     out: list = [json.dumps(result, ensure_ascii=False)]
-    if result['executed']:
-        out.insert(0, Image(data=desktop.to_bytes(desktop.capture().image), format='png'))
+    if after is not None:
+        out.insert(0, after)
     return out
 
 
