@@ -306,6 +306,9 @@ def focus_window(title_contains: str) -> dict:
     fg_thread = u.GetWindowThreadProcessId(fg, None) if fg else 0
     me = k32.GetCurrentThreadId()
     attached = bool(fg_thread and fg_thread != me and u.AttachThreadInput(me, fg_thread, True))
+    if not attached:                                     # fallback: ALT tap lifts the lock
+        u.keybd_event(0x12, 0, 0, 0)
+        u.keybd_event(0x12, 0, 2, 0)
     try:
         u.BringWindowToTop(h)
         u.SetForegroundWindow(h)

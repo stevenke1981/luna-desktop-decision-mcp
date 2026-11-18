@@ -116,6 +116,7 @@ def wait_stable(timeout: float = 2.0, interval: float = 0.12, tolerance: float =
     from PIL import ImageChops, ImageStat
     start = time.time()
     prev = None
+    time.sleep(0.3)               # let navigation / re-render start before comparing frames
     with (mss.MSS() if hasattr(mss, 'MSS') else mss.mss()) as sct:
         mon = _primary(sct)
         while time.time() - start < timeout:
@@ -215,6 +216,7 @@ def _type_text(text: str) -> None:
     Multi-line text: clipboard paste, so newlines never press Enter (which would
     submit chat-style boxes), then restore the previous clipboard text."""
     import pyautogui
+    text = text.replace('\r\n', '\n').replace('\r', '\n')   # a bare CR would press Enter
     if '\n' not in text:
         if sys.platform == 'win32':
             _send_unicode(text)
@@ -243,8 +245,13 @@ def _send_unicode(text: str) -> None:
                     ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD),
                     ('dwExtraInfo', ctypes.c_size_t)]
 
-    class _U(ctypes.Union):
-        _fields_ = [('ki', KEYBDINPUT), ('pad', ctypes.c_byte * 32)]
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [('dx', wintypes.LONG), ('dy', wintypes.LONG), ('mouseData', wintypes.DWORD),
+                    ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('dwExtraInfo', ctypes.c_size_t)]
+
+    class _U(ctypes.Union):           # sized by MOUSEINPUT: correct on 32- and 64-bit
+        _fields_ = [('ki', KEYBDINPUT), ('mi', MOUSEINPUT)]
 
     class INPUT(ctypes.Structure):
         _fields_ = [('type', wintypes.DWORD), ('u', _U)]
@@ -259,4 +266,6 @@ def _send_unicode(text: str) -> None:
             events.append(inp)
     if events:
         arr = (INPUT * len(events))(*events)
-        ctypes.windll.user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+        sent = ctypes.windll.user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+        if sent != len(events):
+            raise OSError('SendInput was blocked (target window may be elevated / UIPI)')

@@ -35,8 +35,10 @@ APPROVAL_TTL = 120
 RISKY_WORDS = re.compile(
     r'send|submit|delete|remove|pay|buy|purchase|order|checkout|generate|create|publish|post|'
     r'install|uninstall|confirm|sign ?out|log ?out|transfer|share|upload|format|reset|erase|'
+    r'\bok\b|\byes\b|save|apply|accept|allow|continue|discard|overwrite|empty|clear|trash|'
+    r'subscribe|\brun\b|'
     r'送出|提交|刪除|删除|移除|付款|購買|结帐|結帳|訂購|產生|生成|建立|發布|發佈|安裝|確認|确认|'
-    r'登出|分享|上傳|轉帳|重設|清除', re.I)
+    r'登出|分享|上傳|轉帳|重設|清除|確定|是|儲存|套用|同意|允許|繼續|捨棄|清空|傳送|寄出|發送|執行', re.I)
 TERMINAL_WORDS = re.compile(r'powershell|terminal|cmd\.exe|命令提示字元|終端機|bash|wsl', re.I)
 ADDRESS_WORDS = re.compile(r'address|網址|地址列|url|執行|run', re.I)
 SAFE_KEYS = {'ESC', 'ESCAPE', 'TAB', 'UP', 'DOWN', 'LEFT', 'RIGHT', 'ARROWUP', 'ARROWDOWN',
@@ -93,7 +95,9 @@ def _luna(fn, *args, **kw):
 
 
 def _risky_element(e) -> bool:
-    return bool(RISKY_WORDS.search(e.name) or e.password)
+    if e.password or RISKY_WORDS.search(f'{e.name} {e.aid}'):
+        return True
+    return e.role == 'button' and not e.name and not e.aid      # unnamed icon button
 
 
 # ------------------------------------------------------------------ locate
@@ -203,15 +207,41 @@ def _tier(action: str, el, where: dict, ob: Obs, text: str | None, keys, submit:
         return 'risky'                      # unknown element under the pointer
     if el is not None and _risky_element(el):
         return 'risky'
+    if action == 'double_click' and (el is None or el.role != 'textbox'):
+        return 'risky'                      # double-click opens / runs things
     if action == 'type':
-        if submit or (el is not None and ADDRESS_WORDS.search(el.name)):
+        if submit or any(ord(c) < 0x20 for c in text or ''):
+            return 'risky'                  # Enter / Tab / CR hidden in the text
+        if el is not None and ADDRESS_WORDS.search(f'{el.name} {el.aid}'):
             return 'risky'
     return 'low'
 
 
-def _key(ob: Obs, action: str, where: dict, el) -> str:
-    ref = el.fingerprint() if el is not None else (where.get('x', 0) // 24, where.get('y', 0) // 24)
-    return f'{ob.window.title if ob.window else ""}|{action}|{ref}'
+def _key(hwnd: int, action: str, ref: Any, text: str | None, submit: bool, keys, scroll) -> str:
+    """Identity of an action for approvals and sticky denies: the window, what is
+    targeted and exactly what will be typed / pressed."""
+    payload = json.dumps([action, ref, text, bool(submit), sorted((keys or [])), scroll],
+                         ensure_ascii=False, default=str)
+    return f'{hwnd}|' + hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+DENY_TTL = 300
+
+
+def _reresolve(ref: Obs, ref_el, ob: Obs):
+    """Find ref_el again in a fresh observation. Elements sharing role+name+aid
+    (one "Delete" per list row) are matched by their order among the duplicates,
+    and only if the number of duplicates is unchanged; otherwise None (STALE)."""
+    ident = (ref_el.role, ref_el.name, ref_el.aid)
+    old = sorted((e for e in ref.list if (e.role, e.name, e.aid) == ident), key=lambda e: (e.y, e.x))
+    new = sorted((e for e in ob.list if (e.role, e.name, e.aid) == ident), key=lambda e: (e.y, e.x))
+    if len(old) == 1 and len(new) == 1:
+        e = new[0]
+        return e if abs(e.x - ref_el.x) <= 200 and abs(e.y - ref_el.y) <= 200 else None
+    if len(old) != len(new) or not new:
+        return None
+    e = new[old.index(ref_el)]
+    return e if abs(e.x - ref_el.x) <= 48 and abs(e.y - ref_el.y) <= 48 else None
 
 
 def _fail(code: str, message: str, fix: str, ob: Obs | None, **extra) -> list:
@@ -316,8 +346,9 @@ def register(server, execution_blocked, audit, redact) -> None:
         for rank, t in enumerate(r['top'], 1):
             what, args = call(t['value'])
             if args:
+                e = ob.elements.get(args.get('element_id', ''))
                 sugg.append({'rank': rank, 'p': t['probability'], 'what': what,
-                             'risky': 'RISKY' in what or args['action'] == 'keypress',
+                             'risky': bool(e and _risky_element(e)) or args['action'] == 'keypress',
                              'call': {'tool': 'act', 'args': args}})
         confident = bool(r['top']) and r['top'][0]['probability'] >= 0.5 and \
             decisions.margin(r['top']) >= 0.2
@@ -356,7 +387,19 @@ def register(server, execution_blocked, audit, redact) -> None:
         S['luna_calls'] = S['luna_ms'] = 0
         ref = S['obs'].get(obs or S['current'] or '')
         ref_el = ref.elements.get(element_id) if (ref and element_id) else None
+        expected_hwnd = ref.window.hwnd if ref and ref.window else 0
         ob = _observe()
+        hwnd = ob.window.hwnd if ob.window else 0
+        target_ref = (ref_el.fingerprint()[:3] if ref_el else None) or target or \
+            ([x, y] if x is not None else None)
+        key = _key(hwnd, action, target_ref, text, submit, keys, scroll)
+        appr = S['approvals'].get(approval_id or '')
+        if appr and (appr['key'] != key or appr['exp'] < time.time()):
+            appr = None
+        if expected_hwnd and perception.foreground_hwnd() != expected_hwnd:
+            title = ref.window.title[:40] if ref and ref.window else ''
+            return _fail('FOCUS_LOST', 'The window you observed is no longer in front.',
+                         f'Call focus_window("{title}") and retry.', ob)
 
         # ---- resolve the target in the fresh observation
         el, where = None, {}
@@ -366,10 +409,7 @@ def register(server, execution_blocked, audit, redact) -> None:
             if ref_el is None:
                 return _fail('STALE', f'{element_id} is not in observation {obs or "(latest)"}.',
                              'Use an element_id from the elements list below.', ob)
-            fp = ref_el.fingerprint()
-            el = next((e for e in ob.list if e.fingerprint() == fp), None) or next(
-                (e for e in ob.list if (e.role, e.name, e.aid) == fp[:3] and
-                 abs(e.x - ref_el.x) <= 48 and abs(e.y - ref_el.y) <= 48), None)
+            el = _reresolve(ref, ref_el, ob)
             if el is None:
                 return _fail('STALE', f'{element_id} ({ref_el.label()}) is no longer on screen.',
                              'Pick from the fresh elements below.', ob)
@@ -377,6 +417,9 @@ def register(server, execution_blocked, audit, redact) -> None:
                      'line': f'{el.id} {el.label()}'}
         elif x is not None and y is not None:
             where = {'by': 'coordinates', 'x': int(x), 'y': int(y)}
+        elif target and appr:
+            where = dict(appr['where'])           # approved: reuse the exact resolved point
+            el = ob.elements.get(where.get('element_id', ''))
         elif target:
             where = _locate(target, ob)
             if not where.get('found'):
@@ -409,29 +452,28 @@ def register(server, execution_blocked, audit, redact) -> None:
             desktop.validate(prim, ob.shot)
 
         tier = _tier(action, el, where, ob, text, keys, submit)
-        key = _key(ob, action, where, el)
         blocked = execution_blocked()
         if blocked:
             return _fail('EXEC_DISABLED', blocked, 'Ask the user to enable execution.', ob,
                          resolved=where, tier=tier)
 
         # ---- foreground + hit-test guards (pointer actions on known elements)
-        if ob.window and ob.window.hwnd and perception.foreground_hwnd() != ob.window.hwnd:
-            return _fail('FOCUS_LOST', 'The observed window is no longer in front.',
-                         f'Call focus_window("{ob.window.title[:40]}") and retry.', ob)
         hit = perception.hit_test(prim['x'], prim['y']) if 'x' in prim else {}
-        if el is not None and hit.get('hwnd') and ob.window and hit['hwnd'] != ob.window.hwnd:
+        if el is not None and hit.get('hwnd') and hwnd and hit['hwnd'] != hwnd:
             return _fail('OCCLUDED', f'Something else is on top of {el.id} '
                          f'({hit.get("role")} "{hit.get("name")}" in "{hit.get("window")}").',
                          'Close the covering window/popup (keypress ESCAPE) and retry.', ob)
+        hit_name = hit.get('name') or ''
+        if hit_name and (RISKY_WORDS.search(hit_name) or (el is not None and el.name and
+                                                         hit_name != el.name)):
+            tier = 'risky'                  # an overlay or a different element is under the pointer
 
         # ---- judgement
         verdict, reasons, approved = 'allow', ['low-risk step: judge skipped'], False
-        appr = S['approvals'].get(approval_id or '')
-        if appr and appr[0] == key and appr[1] > time.time():
+        if appr:
             approved, verdict, reasons = True, 'confirm', ['approved by user']
             S['approvals'].pop(approval_id, None)
-        elif S['denied'].get(key) == ob.hash:
+        elif S['denied'].get(key, 0) > time.time():
             return _fail('DENIED', 'This exact action was already denied on this screen.',
                          'Do not retry or reword it. Choose a different approach or ask the user.', ob)
         elif tier == 'risky' or JUDGE_MODE == 'always':
@@ -440,19 +482,23 @@ def register(server, execution_blocked, audit, redact) -> None:
                        if hit else None)
             if action == 'type' and submit:
                 context = (context or '') + '\nAfter typing, Enter will be pressed to submit.'
-            j = _luna(decisions.judge, goal, prim,
+            shown = dict(prim)
+            if action == 'type' and (el is not None and el.password):
+                shown['text'] = f'<{len(text or "")} characters, password field>'   # never sent
+            j = _luna(decisions.judge, goal, shown,
                       desktop.to_data_url(desktop.annotate(ob.wshot, prim)), S['history'],
                       context=context)
             verdict, reasons = j.verdict, j.reasons
         if verdict == 'deny':
-            S['denied'][key] = ob.hash
+            S['denied'][key] = time.time() + DENY_TTL
             audit('act', goal=goal, action=redact(prim), verdict='deny', executed=False)
             return _fail('DENIED', 'Luna judged this action unsafe or wrong for the goal: '
                          + '; '.join(reasons),
                          'Do not retry or reword it. Call next_step or ask the user.', ob)
         if verdict == 'confirm' and not approved:
             aid = 'ap_' + secrets.token_hex(3)
-            S['approvals'][aid] = (key, time.time() + APPROVAL_TTL)
+            S['approvals'][aid] = {'key': key, 'exp': time.time() + APPROVAL_TTL,
+                                   'where': where}
             what = prim['description'] or decisions.describe_action(prim)
             return _fail('NEEDS_APPROVAL', f'{action} {what} needs the user\'s OK: '
                          + '; '.join(reasons),
@@ -460,7 +506,10 @@ def register(server, execution_blocked, audit, redact) -> None:
                          f'plus approval_id="{aid}" within {APPROVAL_TTL}s. Do not reword.', ob,
                          approval_id=aid)
 
-        # ---- execute
+        # ---- execute (re-check focus: the judge call may have taken a second)
+        if hwnd and perception.foreground_hwnd() != hwnd:
+            return _fail('FOCUS_LOST', 'Another window took focus before the action ran.',
+                         f'Call focus_window("{ob.window.title[:40]}") and retry.', ob)
         executed = False
         try:
             if action == 'type':
@@ -488,18 +537,22 @@ def register(server, execution_blocked, audit, redact) -> None:
         result: dict[str, Any] = {'ok': True, 'status': 'done', 'executed': True, 'did': did,
                                   'resolved': where, 'judge': {'verdict': verdict, 'tier': tier,
                                                                'reasons': reasons}}
-        nxt = None
-        if plan_next:
-            marked = desktop.to_data_url(perception.draw_marks(ob2.wshot, ob2.list))
-            r = _luna(decisions.next_step, goal, {e.id: e.label() for e in ob2.list},
-                      {e.id: e.role for e in ob2.list}, marked, S['history'], expect)
-            nxt = _plan(goal, ob2, r)
-            result['state'] = r['state']
-            exp_p = r['expect']
-        elif expect:
-            r = _luna(decisions.assess, goal, desktop.to_data_url(ob2.wshot.image), expect)
-            result['state'] = r['state']
-            exp_p = r['expect']
+        nxt, exp_p = None, None
+        try:
+            if plan_next:
+                marked = desktop.to_data_url(perception.draw_marks(ob2.wshot, ob2.list))
+                r = _luna(decisions.next_step, goal, {e.id: e.label() for e in ob2.list},
+                          {e.id: e.role for e in ob2.list}, marked, S['history'], expect)
+                nxt = _plan(goal, ob2, r)
+                result['state'] = r['state']
+                exp_p = r['expect']
+            elif expect:
+                r = _luna(decisions.assess, goal, desktop.to_data_url(ob2.wshot.image), expect)
+                result['state'] = r['state']
+                exp_p = r['expect']
+        except Exception as exc:            # the action DID run: never make the agent redo it
+            result['warning'] = f'post-check failed ({type(exc).__name__}); the action was executed'
+            expect = None
         if expect:
             result['expect'] = {'text': expect, 'p': exp_p, 'met': (exp_p or 0) >= 0.6}
             if not result['expect']['met']:

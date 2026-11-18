@@ -316,6 +316,7 @@ class AgentToolTests(unittest.TestCase):
     def test_stale_element(self):
         old = make_obs(el(1, 'button', 'Gone', 300, 200))
         with mock.patch.object(agent_tools, '_observe', return_value=make_obs()), \
+                mock.patch.object(perception, 'foreground_hwnd', return_value=77), \
                 mock.patch.object(desktop, 'execute') as ex:
             res = json.loads(self.tools['act']('g', element_id='e1', obs=old.id)[0])
         ex.assert_not_called()
@@ -336,10 +337,68 @@ class AgentToolTests(unittest.TestCase):
         agent_tools.register(fake, lambda: 'disabled', lambda *a, **k: None, lambda a: a)
         ob = make_obs(el(1, 'button', 'Generate', 300, 200))
         with mock.patch.object(agent_tools, '_observe', return_value=ob), \
+                mock.patch.object(perception, 'foreground_hwnd', return_value=77), \
                 mock.patch.object(decisions, 'call_decisions') as api:
             res = json.loads(tools['act']('g', element_id='e1', obs=ob.id)[0])
         api.assert_not_called()
         self.assertEqual(res['error']['code'], 'EXEC_DISABLED')
+
+    def test_hidden_control_chars_and_double_click_are_risky(self):
+        ob = make_obs()
+        box, item = el(1, 'textbox', 'Name', 1, 1), el(2, 'listitem', 'setup.exe', 1, 1)
+        k = {'by': 'element_id'}
+        self.assertEqual(agent_tools._tier('type', box, k, ob, 'del *' + chr(13), None, False),
+                         'risky')
+        self.assertEqual(agent_tools._tier('type', box, k, ob, 'hello', None, False), 'low')
+        self.assertEqual(agent_tools._tier('double_click', item, k, ob, None, None, False), 'risky')
+        self.assertTrue(agent_tools._risky_element(el(3, 'button', '', 1, 1)))      # unnamed icon
+        self.assertTrue(agent_tools._risky_element(el(4, 'button', '傳送', 1, 1)))
+
+    def test_keys_bind_payload(self):
+        a = agent_tools._key(77, 'keypress', None, None, False, ['ENTER'], None)
+        b = agent_tools._key(77, 'keypress', None, None, False, ['ALT', 'F4'], None)
+        c = agent_tools._key(77, 'type', ('textbox', 'x', ''), 'hi', True, None, None)
+        d = agent_tools._key(77, 'type', ('textbox', 'x', ''), 'bye', True, None, None)
+        self.assertEqual(len({a, b, c, d}), 4)
+
+    def test_overlay_under_pointer_forces_judge(self):
+        songs = el(1, 'link', 'Songs', 300, 200)
+        state = {}
+
+        def observe(*a):
+            state['ob'] = make_obs(songs)
+            return state['ob']
+        j = mock.Mock(return_value=decisions.Judgement('allow', ['x']))
+        with mock.patch.object(agent_tools, '_observe', side_effect=observe),                 mock.patch.object(decisions, 'judge', j),                 mock.patch.object(perception, 'foreground_hwnd', return_value=77),                 mock.patch.object(perception, 'hit_test',
+                                  return_value={'hwnd': 77, 'name': 'Delete', 'role': 'button'}),                 mock.patch.object(desktop, 'wait_stable'), mock.patch.object(desktop, 'execute'):
+            obs = make_obs(songs).id
+            res = json.loads(self.tools['act']('g', obs=obs, element_id='e1')[0])
+        j.assert_called_once()
+        self.assertEqual(res['judge']['tier'], 'risky')
+
+    def test_duplicate_names_resolve_by_order_or_stale(self):
+        rows = [el(i, 'button', 'Delete', 500, 100 * i) for i in (1, 2, 3)]
+        ref = make_obs(*rows)
+        same = make_obs(*[el(i, 'button', 'Delete', 500, 100 * i) for i in (1, 2, 3)])
+        self.assertEqual(agent_tools._reresolve(ref, ref.elements['e2'], same).y, 200)
+        inserted = make_obs(*[el(i, 'button', 'Delete', 500, 100 * i) for i in (1, 2, 3, 4)])
+        self.assertIsNone(agent_tools._reresolve(ref, ref.elements['e2'], inserted))
+
+    def test_password_text_not_sent_to_judge(self):
+        res, ex, j = self._act([perception.Element('e1', 'textbox', 'Password', 300, 200, 290, 195,
+                                                   310, 205, password=True)],
+                               action='type', element_id='e1', text='hunter2')
+        sent = j.call_args.args[1]['text']
+        self.assertNotIn('hunter2', sent)
+        self.assertEqual([c.args[0].get('text') for c in ex.call_args_list][-1], 'hunter2')
+
+    def test_post_check_failure_still_reports_executed(self):
+        with mock.patch.object(decisions, 'assess', side_effect=TimeoutError):
+            res, ex, _ = self._act([el(1, 'link', 'Songs', 300, 200)], element_id='e1',
+                                   expect='Songs are listed')
+        ex.assert_called_once()
+        self.assertTrue(res['executed'])
+        self.assertIn('post-check failed', res['warning'])
 
     def test_next_step_plan_shape(self):
         ob = make_obs(el(1, 'textbox', 'Prompt', 300, 200))
