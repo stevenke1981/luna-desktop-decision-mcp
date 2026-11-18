@@ -405,7 +405,8 @@ def register(server, execution_blocked, audit, redact) -> None:
 
         Statuses: done | needs_approval (ask the user, then repeat the SAME call
         with approval_id) | denied (do not retry) | ambiguous (pick a candidate)
-        | not_found | stale | focus_lost | occluded | exec_disabled."""
+        | not_found | stale | focus_lost | occluded | exec_disabled |
+        text_delivery_unknown | submit_unknown."""
         t0 = time.time()
         S['luna_calls'] = S['luna_ms'] = 0
         ref = S['obs'].get(obs or S['current'] or '')
@@ -539,32 +540,62 @@ def register(server, execution_blocked, audit, redact) -> None:
             return _fail('FOCUS_LOST', 'Another window took focus before the action ran.',
                          f'Call focus_window("{ob.window.title[:40]}") and retry.', ob)
         executed = False
+        text_delivery = None
         try:
             if action == 'type':
                 if 'x' in prim:
                     desktop.execute({'type': 'click', 'x': prim['x'], 'y': prim['y']})
                     time.sleep(0.15)
-                desktop.execute({'type': 'type', 'text': text})
+                native_edit = bool(el and el.role == 'textbox' and not el.password)
+                text_delivery = desktop.execute(prim, expected_hwnd=hwnd, native_edit=native_edit)
                 if submit:
-                    desktop.execute({'type': 'keypress', 'keys': ['ENTER']})
+                    desktop.execute({'type': 'keypress', 'keys': ['ENTER']},
+                                    expected_focus=text_delivery.focus if text_delivery else None)
             elif action == 'wait':
                 time.sleep(2.0)
             else:
                 desktop.execute(prim)
             executed = True
+        except desktop.FocusLost as exc:
+            executed = text_delivery is not None
+            receipt = {'text_delivery': text_delivery.status} if text_delivery else {}
+            return _fail('FOCUS_LOST', str(exc),
+                         'Inspect the field. If needed, submit it separately.' if executed
+                         else 'Focus the intended field and observe again before typing.',
+                         None, executed=executed, **receipt)
+        except desktop.TextDeliveryUnknown as exc:
+            executed = None
+            return _fail('TEXT_DELIVERY_UNKNOWN', str(exc),
+                         'Observe and inspect the field before doing anything else. Do not repeat the text.',
+                         None, executed=None)
+        except Exception:
+            if text_delivery is None:
+                raise
+            executed = True
+            return _fail('SUBMIT_UNKNOWN', 'Text was sent but submission could not be confirmed.',
+                         'Observe the result before taking another action. Do not repeat the text.',
+                         None, executed=True, text_delivery=text_delivery.status)
         finally:
             audit('act', goal=goal, action=redact(prim), verdict=verdict, tier=tier,
                   executed=executed, by=where.get('by'))
         did = f'{action} {prim["description"] or decisions.describe_action(prim)}'
         S['history'].append(did[:120])
         del S['history'][:-20]
-        desktop.wait_stable(2.0)
-
         # ---- new screen (+ one Luna request for expect / next step)
-        ob2 = _observe()
         result: dict[str, Any] = {'ok': True, 'status': 'done', 'executed': True, 'did': did,
                                   'resolved': where, 'judge': {'verdict': verdict, 'tier': tier,
                                                                'reasons': reasons}}
+        if text_delivery is not None:
+            result['text_delivery'] = text_delivery.status
+        try:
+            desktop.wait_stable(2.0)
+            ob2 = _observe()
+        except Exception as exc:
+            if text_delivery is None:
+                raise
+            result['warning'] = f'post-observation failed ({type(exc).__name__}); the text was sent'
+            result['next'] = [{'tool': 'observe', 'args': {}}]
+            return [json.dumps(result, ensure_ascii=False)]
         nxt, exp_p = None, None
         try:
             if plan_next:
@@ -594,8 +625,14 @@ def register(server, execution_blocked, audit, redact) -> None:
             result['next'] = [{'tool': 'next_step', 'args': {'goal': goal}}]
         result['ms'] = {'total': int((time.time() - t0) * 1000), 'luna': S['luna_ms'],
                         'luna_calls': S['luna_calls']}
-        out: list = [json.dumps(result, ensure_ascii=False)]
+        out: list = []
         if include_image:
-            out.append(Image(data=desktop.to_bytes(perception.draw_marks(ob2.wshot, ob2.list), 'JPEG'),
-                             format='jpeg'))
+            try:
+                out.append(Image(data=desktop.to_bytes(perception.draw_marks(ob2.wshot, ob2.list), 'JPEG'),
+                                 format='jpeg'))
+            except Exception as exc:
+                if text_delivery is None:
+                    raise
+                result.setdefault('warning', f'post-action image failed ({type(exc).__name__}); the text was sent')
+        out.insert(0, json.dumps(result, ensure_ascii=False))
         return out

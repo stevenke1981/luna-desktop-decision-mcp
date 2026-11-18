@@ -26,6 +26,8 @@ Decisions 只回傳型別化答案（choice／predicate／score），不會回�
 
 `done`、`expect_failed`、`needs_approval`（回傳 `approval_id`，使用者同意後用**同樣參數**加上它再呼叫）、`denied`（同一畫面上會一直拒絕，不要改寫重試）、`ambiguous`（附 `candidates`）、`not_found`、`stale`、`focus_lost`、`occluded`、`exec_disabled`。每個錯誤都有 `error.fix` 告訴 agent 下一步。
 
+文字輸入回傳 `text_delivery`。`verified` 表示已從原生欄位讀回預期內容，`dispatched` 表示已呼叫輸入後端，可用 `observe` 或 `expect` 核對。遇到 `text_delivery_unknown` 或 `submit_unknown` 時，先查閱欄位或送出結果，避免重送。若輸入成功後失去焦點，`focus_lost` 會回報 `executed: true`，供 agent 判斷是否只需另行送出。
+
 ### 速度與安全的取捨
 
 - **低風險步驟不判斷**（捲動、Esc/Tab/方向鍵、點一般連結／分頁／欄位、輸入不送出）→ 0 次 Luna。
@@ -33,10 +35,25 @@ Decisions 只回傳型別化答案（choice／predicate／score），不會回�
 - **事先同意**（`LUNA_PREAPPROVE`）：你已經交代過的送出鍵（例如「做一首歌」時的 Send message）不必每次再核准。只適用於「點擊」有名稱的 UIA 元素，按鈕名稱需完全相符、視窗標題需包含指定文字，格線或座標定位不算；Luna 仍會判斷，`deny` 照樣擋下。設定放在伺服器環境變數，agent 無法自己授權。
 - 判斷用的動作描述由**伺服器依 UIA 名稱產生**，不採用 agent 的文字，避免換句話說繞過；被 `deny` 的動作在畫面未變前會直接拒絕。
 - 執行前檢查前景視窗與滑鼠下的元素（UIA hit-test），被遮住或失焦就回 `occluded`／`focus_lost`，不會點錯視窗。
+- 已定位的標準 Windows 多行 Edit 欄位，在核對焦點後用一次可復原的原生插入動作，接著讀回欄位。單行文字使用批次 Unicode 鍵盤事件，其他多行欄位沿用貼上。換行以文字處理，只有經判斷的 `submit=true` 才會另按 Enter。
 - 送給 Luna 的截圖只裁切目標視窗（不含 agent 自己的終端機），並以 JPEG 傳送。
 - 畫面文字一律視為**不可信資料**：清除控制字元、截斷長度，並在回應中標記 `untrusted_text`。
 
 實測（Chrome + Flow Music）：`observe` 0.56 秒、`next_step` 1.3 秒（1 次 Luna）、名稱可直接比對的點擊 0 次 Luna。
+
+另有獨立的 [Windows 多行文字派送與讀回實測](benchmarks/windows-text-input.md)。
+
+### 與 ChatGPT Computer Use 的功能對照
+
+| 操作 | 本 MCP |
+|---|---|
+| 視窗與觀察 | `focus_window` 依標題啟用，`observe` 讀取前景 UIA 與選用截圖。視窗列舉、應用程式列舉與啟動未提供獨立工具。 |
+| 語意定位 | `locate` 依 UIA 名稱、Luna 元素候選或畫面格線定位。 |
+| 文字與值 | `act(action="type")` 在插入點輸入或取代選取文字，支援文字傳遞收據。任意控制項的 `set_value` 未提供。 |
+| 點擊、鍵盤與捲動 | `act` 提供點擊、雙擊、右鍵、按鍵與捲動。拖曳由啟用後的舊版 `perform_desktop_action` 提供。 |
+| 恢復與核對 | 回傳焦點遺失、目標變更、遮擋、待核准或傳遞不明等狀態。`expect` 提供選用的結果核對。 |
+
+瀏覽器操作需要透過能確認分頁網址與帳戶的受支援介面。該介面要求停止時，應遵守停止指示。
 
 ## 安裝
 
